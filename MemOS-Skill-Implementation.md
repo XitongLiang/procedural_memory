@@ -1,84 +1,159 @@
-# MemOS Skill 实现分析
+# MemOS 消息处理与程序记忆提取全流程分析
 
-## 项目概览
-
-MemOS 是一个 AI 记忆操作系统，包含两套独立实现：
-
-| | Python 端 | TypeScript 端 |
-|---|-----------|---------------|
-| 定位 | 云端/自托管 API 服务 | 本地嵌入式插件 |
-| 框架 | FastAPI (port 8001) | OpenClaw Plugin SDK |
-| 存储 | 多后端 | SQLite (本地文件) |
-| Skill 处理 | 批量聚类 | 实时增量判断 |
-| 依赖 | 独立部署 | 进程内运行，无网络依赖 |
-
-两端实现相同的概念（memory cube、skill evolution、hybrid search），但代码完全独立。
+> 基于 https://github.com/MemTensor/MemOS 源码（2026-04 版本）
 
 ---
 
-## 一、TS 端整体架构
+## 一、TS 端 vs Python 端
 
-### 1.1 插件注册
+MemOS 包含两套独立实现，代码完全独立。
 
-入口文件：`apps/memos-local-openclaw/index.ts`
+### 1.1 架构差异
 
-通过 OpenClaw Plugin SDK 注册，声明文件 `openclaw.plugin.json`：
+```
+TS 端：本地嵌入式插件，跑在 OpenClaw 进程内
+  apps/memos-local-openclaw/index.ts → 各子模块 → SQLite 本地文件
+
+Python 端：云端/自托管 API 服务
+  FastAPI (port 8001) → 多后端存储 → OSS/Local + MySQL + 图谱DB
+```
+
+### 1.2 功能差异
+
+| 维度 | TS 端（本地插件） | Python 端（云端服务） |
+|---|---|---|
+| **运行方式** | 进程内，无网络依赖 | 独立部署，FastAPI |
+| **存储** | SQLite（本地文件） | 多后端（OSS/Local + MySQL） |
+| **消息处理** | 实时增量（游标机制） | 批量处理（全量消息） |
+| **主题分割** | 逐 turn 线性判断（LLM） | 一次性 LLM 聚类（支持非连续回溯） |
+| **Skill 提取** | 评估 → 搜索 → 创建/升级（6 个子模块） | 两阶段提取（简单 + 详细） |
+| **Skill 进化** | 升级已有 Skill（版本 +1） | 更新模式（old_memory_id 回写） |
+| **检索注入** | before_prompt_build hook + LLM 过滤 | API 调用 |
+| **去重** | 两级（精确 hash + 语义 LLM） | 由 LLM 在提取时判断 update vs 新建 |
+| **质量门控** | Rule filter + LLM 评估 + LLM 质量打分(0-10) | 无独立质量门控 |
+| **文件输出** | SKILL.md + scripts/ + references/ + evals/ | SKILL.md + scripts/ + reference/ → zip 包 |
+| **语言检测** | CJK 字符比例 > 15% → 中文 | `detect_lang()` 函数 |
+
+### 1.3 LLM 调用次数
+
+```
+TS 端——一个任务从消息到 Skill 的完整链路：
+  消息摘要(N次) + 去重(N次) + 主题分类(N次)     ← IngestWorker + TaskProcessor
+  + 任务摘要(1) + 任务标题(1)                    ← Task Finalize
+  + 相关性搜索 Judge(1)                          ← SkillEvolver
+  + 创建/升级评估(1)                             ← Evaluator
+  + SKILL.md 生成(1) + scripts(1) + refs(1) + evals(1)  ← Generator（新建路径）
+  + 质量评估(1)                                  ← Validator
+  ≈ 3N + 8 次（N = 消息条数）
+
+  或：升级路径
+  + 升级 Prompt(1) + scripts rebuild(1) + evals rebuild(1) + refs rebuild(1)
+  + 质量评估(1)                                  ← Validator
+  ≈ 3N + 7 次
+
+Python 端——一次批处理：
+  任务分块(1) + 查询改写(M次) + Skill 提取(M次)   ← M = 任务数
+  + scripts(K次) + tools(K次) + others(K次)       ← K = 需要详细生成的 Skill 数
+  ≈ 1 + 2M + 3K 次
+```
+
+### 1.4 核心共同点
+
+- 都输出 SKILL.md（YAML frontmatter + Markdown 内容）
+- 都做语言一致性（Prompt 和输出跟用户对话语言匹配）
+- 都支持 update/merge 逻辑（避免重复 Skill）
+- 都强调通用化——去掉具体细节，提取可复用方法论
+- 都有脚本和参考文档的附属文件
+
+**以下以 TS 端（完整版）为主线展开，Python 端在第十一章单独介绍。**
+
+---
+
+## 二、TS 端完整走线
+
+### 2.1 整体流程
+
+```
+用户发送消息
+    │
+    ▼
+[Hook: before_prompt_build]  ──── 召回路径 ────────────────
+    │
+    ├── normalizeAutoRecallQuery（清洗 query）
+    ├── 并行搜索：本地记忆 + Hub 记忆
+    ├── LLM 相关性过滤（FILTER_RELEVANT_PROMPT）
+    ├── 搜索相关 Skill
+    └── 返回 { prependContext: 注入块 }
+    │
+    ▼
+OpenClaw 处理轮次（LLM 调用、工具使用）
+    │
+    ▼
+[Hook: agent_end]  ──── 提取路径 ────────────────────────
+    │
+    ├── 游标增量提取新消息（sessionMsgCursor）
+    ├── captureMessages（清洗过滤）
+    │
+    ├── IngestWorker
+    │   ├── [Step 1] 摘要生成（LLM）
+    │   ├── [Step 2] 两级去重（hash + LLM）
+    │   └── 写入 SQLite
+    │
+    ├── TaskProcessor
+    │   ├── [Step 3] 主题分类（LLM）
+    │   ├── [Step 3b] 低置信度仲裁（LLM）
+    │   └── 主题切换时 → finalizeTask
+    │       ├── [Step 4] 任务摘要（LLM）
+    │       └── 跳过条件检查
+    │
+    └── SkillEvolver（Task finalize 回调）
+        ├── [Step 5] Rule Filter（纯逻辑）
+        ├── [Step 6] 搜索相关 Skill + LLM Judge
+        │
+        ├── 无匹配 → 创建路径
+        │   ├── [Step 7a] 创建评估（LLM）
+        │   ├── [Step 8a] SKILL.md 生成（LLM）
+        │   ├── [Step 9a] Scripts + Refs（并行 LLM）
+        │   ├── [Step 10a] Evals 生成（LLM）
+        │   └── [Step 11] 质量验证（LLM）
+        │
+        └── 有匹配 → 升级路径
+            ├── [Step 7b] 升级评估（LLM）
+            ├── [Step 8b] 升级合并（LLM）
+            ├── [Step 9b] 附属文件重建（3× LLM）
+            └── [Step 11] 质量验证（LLM）
+```
+
+### 2.2 Hook 注册
 
 ```typescript
+// apps/memos-local-openclaw/index.ts
 const memosLocalPlugin = {
   id: "memos-local-openclaw-plugin",
   kind: "memory",
-  register(api: OpenClawPluginApi) {
-    // 1. 注册记忆能力（构建 system prompt 中的记忆指引）
+  register(api) {
+    // 记忆能力声明（注入 system prompt 的记忆指引）
     api.registerMemoryCapability({ promptBuilder: buildMemoryPromptSection });
 
-    // 2. 注册工具（供 Agent 主动调用）
+    // ~20 个工具（memory_search, skill_get, skill_install 等）
     api.registerTool("memory_search", ...);
-    api.registerTool("memory_get", ...);
     api.registerTool("skill_get", ...);
-    // ... 共 ~20 个工具
+    // ...
 
-    // 3. 注册生命周期 Hook
-    api.on("before_prompt_build", ...);  // prompt 构建前：自动召回记忆/Skill
-    api.on("agent_end", ...);            // 对话结束后：捕获消息、存储、触发 Skill 进化
+    // 两个核心 Hook
+    api.on("before_prompt_build", handler);  // 召回 + 注入
+    api.on("agent_end", handler);            // 捕获 + 提取
   }
 };
 ```
 
-### 1.2 两个核心 Hook
-
-#### `before_prompt_build` — 自动召回
-
-用户发消息前触发，注入相关记忆和 Skill 到 prompt：
-
-```
-用户消息 → normalizeAutoRecallQuery（清洗 query）
-  → 并行搜索：本地记忆 + Hub 记忆
-  → LLM 过滤相关性
-  → 搜索相关 Skill
-  → 返回 { prependContext: "..." } 注入 system prompt
-```
-
-#### `agent_end` — 消息捕获与处理
-
-对话结束后触发，捕获新消息并处理：
-
-```
-event.messages（全量消息）
-  → 游标增量提取（sessionMsgCursor）
-  → captureMessages（清洗）
-  → worker.enqueue（存储）
-  → TaskProcessor（主题分割）
-  → SkillEvolver（Skill 提取）
-```
-
 ---
 
-## 二、消息捕获流程
+## 三、Step 1 — 消息捕获
 
-### 2.1 游标机制（增量提取）
+### 3.1 游标机制（增量提取）
 
-文件：`index.ts` L2155-2298
+文件：`index.ts`
 
 OpenClaw 每次 `agent_end` 给的是全量消息，用游标避免重复处理：
 
@@ -96,21 +171,17 @@ const newMessages = allMessages.slice(cursor);
 sessionMsgCursor.set(cursorKey, allMessages.length);
 ```
 
-示意：
-
 ```
 第1轮: messages = [u1, a1]             → cursor 0→2, 处理 [u1, a1]
 第2轮: messages = [u1, a1, u2, a2]     → cursor 2→4, 处理 [u2, a2]
 第3轮: messages = [u1, a1, u2, a2, u3, a3] → cursor 4→6, 处理 [u3, a3]
 ```
 
-### 2.2 captureMessages — 消息清洗
+### 3.2 captureMessages — 消息清洗
 
 文件：`src/capture/index.ts`
 
-输入原始消息，输出干净的 `ConversationMessage[]`：
-
-**过滤规则**（直接丢弃）：
+**直接丢弃**：
 
 | 类型 | 示例 |
 |------|------|
@@ -137,46 +208,115 @@ sessionMsgCursor.set(cursorKey, allMessages.length);
 {
   role: "user" | "assistant" | "tool",
   content: string,      // 清洗后的纯文本
-  timestamp: number,    // 毫秒时间戳
-  turnId: string,       // 本轮唯一 ID
-  sessionKey: string,   // 会话标识
-  toolName?: string,    // tool 消息的工具名
+  timestamp: number,
+  turnId: string,
+  sessionKey: string,
+  toolName?: string,
   owner: string,        // "agent:main" 等
 }
 ```
 
 ---
 
-## 三、消息存储（IngestWorker）
+## 四、Step 2 — 消息存储（IngestWorker）
 
 文件：`src/ingest/worker.ts`
 
-### 3.1 处理流程
+### 4.1 处理流程
 
 ```
 enqueue(messages)
   → 过滤临时 session（temp:、internal:、system:）
   → 逐条 ingestMessage()
-    → summarizer.summarize(content)  // LLM 生成摘要
-    → embedder.embed([summary])      // 生成向量
+    → [短路] 内容 ≤ 10 词 → 直接用原文当摘要，不调 LLM
+    → summarizer.summarize(content)   // LLM 生成摘要
+    → embedder.embed([summary])       // 生成向量
     → 去重检查（两级）
-    → store.insertChunk(chunk)       // 写入 SQLite
-    → store.upsertEmbedding(...)     // 写入向量索引
-  → taskProcessor.onChunksIngested() // 触发主题分割
+    → store.insertChunk(chunk)        // 写入 SQLite
+    → store.upsertEmbedding(...)      // 写入向量索引
+  → taskProcessor.onChunksIngested()  // 触发主题分割
 ```
 
-### 3.2 两级去重
+### 4.2 摘要 Prompt
 
-**Level 1 — 精确去重**：`content_hash` 完全匹配 → 淘汰旧 chunk，保留新的
+**作用**：为每条消息生成一个检索友好的名词短语标题（不是完整摘要）。
 
-**Level 2 — 语义去重**：
-- 向量相似度 > 0.80 的 top-5 候选
-- LLM 判断：
-  - `DUPLICATE` → 淘汰旧的，新的保持 active
-  - `UPDATE` → 合并摘要，淘汰旧的
-  - `NEW` → 直接存储
+```
+You generate a retrieval-friendly title.
 
-### 3.3 Chunk 数据结构
+Return exactly one noun phrase that names the topic AND its key details.
+
+Requirements:
+- Same language as input
+- Keep proper nouns, API/function names, specific parameters, versions, error codes
+- Include WHO/WHAT/WHERE details when present
+  (e.g. person name + event, tool name + what it does)
+- Prefer concrete topic words over generic words
+- No verbs unless unavoidable
+- No generic endings like:
+  功能说明、使用说明、简介、介绍、用途、summary、overview、basics
+- Chinese: 10-50 characters (aim for 15-30)
+- Non-Chinese: 5-15 words (aim for 8-12)
+- Output title only
+```
+
+**参数**：`temperature: 0`，`max_tokens: 100`，`timeout: 30s`
+
+**输入**：`[TEXT TO SUMMARIZE]\n{content}\n[/TEXT TO SUMMARIZE]`
+
+**短路**：内容 ≤ 10 词 → 直接返回清洗后的原文，不调 LLM。
+
+### 4.3 两级去重
+
+**Level 1 — 精确去重**：`content_hash` 完全匹配 → 淘汰旧 chunk，保留新的。
+
+**Level 2 — 语义去重**：向量相似度 > 0.80 的 top-5 候选 → LLM 判断。
+
+**去重 Prompt**：
+
+```
+You are a memory deduplication system.
+
+LANGUAGE RULE (MUST FOLLOW): You MUST reply in the SAME language as the input
+memories. 如果输入是中文，reason 和 mergedSummary 必须用中文。If input is English,
+reply in English.
+
+Given a NEW memory summary and several EXISTING memory summaries, determine
+the relationship.
+
+For each EXISTING memory, the NEW memory is either:
+- "DUPLICATE": NEW conveys the same intent/meaning as an EXISTING memory,
+  even if worded differently. Examples: "请告诉我你的名字" vs "你希望我怎么称呼你";
+  greetings with minor variations. If the core information/intent is the same,
+  it IS a duplicate.
+- "UPDATE": NEW contains meaningful additional information that supplements
+  an EXISTING memory (new data, status change, concrete detail not present before)
+- "NEW": NEW covers a genuinely different topic/event with no semantic overlap
+
+IMPORTANT: Lean toward DUPLICATE when memories share the same intent, topic,
+or factual content. Only choose NEW when the topics are truly unrelated.
+
+Pick the BEST match among all candidates. If none match well, choose "NEW".
+
+Output a single JSON object:
+- If DUPLICATE: {"action":"DUPLICATE","targetIndex":2,"reason":"..."}
+- If UPDATE: {"action":"UPDATE","targetIndex":3,"reason":"...","mergedSummary":"..."}
+- If NEW: {"action":"NEW","reason":"..."}
+```
+
+**参数**：`temperature: 0`，`max_tokens: 300`，`timeout: 15s`
+
+**输入**：`NEW MEMORY:\n{newSummary}\n\nEXISTING MEMORIES:\n1. {summary1}\n2. {summary2}\n...`
+
+**执行逻辑**：
+
+```
+DUPLICATE → 淘汰旧 chunk（标记 dedupStatus="duplicate"），新 chunk 标记 active
+UPDATE   → 合并摘要（用 LLM 返回的 mergedSummary），淘汰旧 chunk
+NEW      → 直接存储为 active
+```
+
+### 4.4 Chunk 数据结构
 
 ```typescript
 interface Chunk {
@@ -187,7 +327,7 @@ interface Chunk {
   role: "user" | "assistant" | "tool";
   content: string;         // 原始内容
   kind: "paragraph";
-  summary: string;         // LLM 生成的摘要
+  summary: string;         // LLM 生成的标题
   embedding: number[];     // 向量
   taskId: string | null;   // 所属任务
   skillId: string | null;  // 关联 Skill
@@ -202,15 +342,15 @@ interface Chunk {
 
 ---
 
-## 四、主题分割（TaskProcessor）
+## 五、Step 3 — 主题分割（TaskProcessor）
 
 文件：`src/ingest/task-processor.ts`
 
-### 4.1 触发时机
+### 5.1 触发时机
 
 每次 IngestWorker 存完一批 chunks 后调用 `onChunksIngested()`。
 
-### 4.2 判断逻辑
+### 5.2 判断逻辑
 
 三种条件触发"新任务"：
 
@@ -220,7 +360,7 @@ interface Chunk {
 | 时间间隔超限 | 直接切 | > 2h |
 | 主题变了 | LLM 判断 | confidence ≥ 0.65 |
 
-### 4.3 增量主题检测流程
+### 5.3 增量主题检测流程
 
 ```
 未分配的 chunks → 按 user turn 分组
@@ -235,26 +375,56 @@ interface Chunk {
   → 超时 → finalize 旧任务，创建新任务
   ↓
 buildTopicJudgeState() 构建上下文：
-  - topic: 第一条 user 消息摘要
+  - topic: 第一条 user 消息摘要（或内容前 80 字符）
   - 最近 3 轮 user/assistant 摘要
-  - 短消息/代词开头 → 附带上一条 assistant 回复
+  - 短消息（<30字符）或代词开头 → 附带上一条 assistant 回复（前 200 字符）
   ↓
-summarizer.classifyTopic(taskState, newMsg)
-  → LLM 返回：{ decision: "SAME"|"NEW", confidence, boundaryType, reason }
+classifyTopic(taskState, newMsg)                    🤖 LLM
+  → 返回 { decision: "SAME"|"NEW", confidence }
   ↓
 decision == "NEW" && confidence < 0.65？
-  → 二次仲裁 arbitrateTopicSplit()
+  → 二次仲裁 arbitrateTopicSplit()                   🤖 LLM
   ↓
 确认 NEW → finalizeTask(旧任务) → 创建新任务
 ```
 
-### 4.4 任务 Finalize
+### 5.4 主题分类 Prompt
+
+```
+Classify if NEW MESSAGE continues current task or starts an unrelated one.
+Output ONLY JSON: {"d":"S"|"N","c":0.0-1.0}
+d=S(same) or N(new). c=confidence. Default S.
+Only N if completely unrelated domain.
+Sub-questions, tools, methods, details of current topic = S.
+```
+
+**参数**：`temperature: 0`，`max_tokens: 60`，`timeout: 15s`
+
+**输入**：`TASK:\n{taskState}\n\nMSG:\n{newMessage}`
+
+**输出**：`{"d":"S","c":0.85}` → 映射为 `{decision: "SAME", confidence: 0.85}`
+
+### 5.5 仲裁 Prompt（二次确认）
+
+当分类返回 NEW 但 confidence < 0.65 时触发：
+
+```
+A classifier flagged this message as possibly new topic (low confidence).
+Is it truly UNRELATED, or a sub-question/follow-up?
+Tools/methods/details of current task = SAME.
+Shared entity/theme = SAME. Entirely different domain = NEW.
+Reply one word: NEW or SAME
+```
+
+**参数**：`temperature: 0`，`max_tokens: 10`，`timeout: 15s`
+
+### 5.6 任务 Finalize
 
 ```typescript
-async finalizeTask(task: Task) {
+async finalizeTask(task) {
   const chunks = this.store.getChunksByTask(task.id);
 
-  // 过滤：太少(<4 chunks)、太短(<200 chars)、纯闲聊等 → 标记 skipped
+  // 跳过条件（任一满足则不生成摘要）
   const skipReason = this.shouldSkipSummary(chunks);
   if (skipReason) { /* 标记 skipped */ return; }
 
@@ -269,7 +439,7 @@ async finalizeTask(task: Task) {
 }
 ```
 
-**跳过条件**（任一满足则不生成摘要）：
+**跳过条件**（任一满足则不触发 Skill 提取）：
 1. chunks < 4
 2. 真实对话轮数 < 2
 3. 无 user 消息
@@ -278,100 +448,736 @@ async finalizeTask(task: Task) {
 6. 全是 tool 结果
 7. 高重复率（调试循环）
 
+### 5.7 任务摘要 Prompt
+
+```
+You create a DETAILED task summary from a multi-turn conversation.
+This summary will be the ONLY record of this conversation, so it must
+preserve ALL important information.
+
+## LANGUAGE RULE (HIGHEST PRIORITY)
+Detect the PRIMARY language of the user's messages. If most user messages
+are Chinese, ALL output MUST be in Chinese. If English, output in English.
+
+Output EXACTLY this structure:
+
+📌 Title / 标题
+A short, descriptive title (10-30 characters).
+
+🎯 Goal / 目标
+One sentence: what the user wanted to accomplish.
+
+📋 Key Steps / 关键步骤
+- Describe each meaningful step in detail
+- Include the ACTUAL content produced: code snippets, commands, config blocks
+- For code: include function signature and core logic (up to ~30 lines)
+- Do NOT over-summarize: "provided a function" is BAD; show the actual function
+
+✅ Result / 结果
+What was the final outcome?
+
+💡 Key Details / 关键细节
+- Decisions made, trade-offs discussed, caveats noted
+- Specific values: numbers, versions, thresholds, URLs, file paths
+
+RULES:
+- This summary is a KNOWLEDGE BASE ENTRY, not a brief note. Be thorough.
+- PRESERVE verbatim: code, commands, URLs, file paths, error messages
+- DISCARD only: greetings, filler
+- Replace secrets (API keys, tokens) with [REDACTED]
+- Target length: 30-50% of original conversation.
+- Output summary only, no preamble.
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 4096`，`timeout: 60s`
+
+**输入**：完整对话文本，格式为 `[User]: {content}\n\n[Assistant]: {content}\n\n...`
+
+**标题解析**：正则 `/📌\s*(?:Title|标题)\s*\n(.+)/` 从输出中提取。
+
 ---
 
-## 五、Skill 提取与进化（SkillEvolver）
+## 六、Step 4-6 — Skill 评估（SkillEvolver + Evaluator）
 
-文件：`src/skill/evolver.ts`
+文件：`src/skill/evolver.ts`、`src/skill/evaluator.ts`
 
-### 5.1 触发条件
-
-**输入不是单条消息，而是一个完整的已结束任务（Task）及其全部 chunks。**
+### 6.1 入口
 
 ```
 Task finalize → onTaskCompletedCallback → SkillEvolver.onTaskCompleted(task)
 ```
 
-时间线示意：
+如果 evolver 正在处理其他任务，新任务进入队列，按顺序处理。
+
+### 6.2 Step 4 — Rule Filter（纯逻辑，不用 LLM）
 
 ```
-轮1-3: 用户讨论主题A  →  归入 Task-1
-轮4:   用户切换到主题B →  触发 Task-1 finalize
-                            ↓
-                        Task-1 全部 chunks → SkillEvolver
-                            ↓
-                        评估整体是否值得提取 Skill
+chunks.length < 6          → skip（默认 minChunksForEval = 6）
+task.status === "skipped"   → skip
+task.summary.length < 100   → skip
+无 user chunks              → skip
+无 assistant chunks         → skip
 ```
 
-### 5.2 完整流程
+### 6.3 Step 5 — 搜索相关 Skill
+
+**两阶段搜索**：
 
 ```
-SkillEvolver.process(task)
-  ↓
-[1] Rule Filter（evaluator.passesRuleFilter）
-    - chunks ≥ 5
-    - status != "skipped"
-    - summary ≥ 100 字符
-    - 必须有 user + assistant 消息
-  ↓
-[2] LLM 评估是否值得（evaluator.evaluateCreate）
-    - CREATE_EVAL_PROMPT
-    - 标准：可重复？可迁移？有技术深度？
-    - 排除：纯 Q&A、一次性任务、闲聊
-    - 输出：{ shouldGenerate, reason, suggestedName, suggestedTags, confidence }
-  ↓
-[3] 搜索相关已有 Skill（findRelatedSkill）
-    - FTS + 向量搜索（阈值 0.35）
-    - Top-10 候选 → LLM 严格判断哪个高度相关
-  ↓
-[4A] 无匹配 → 创建新 Skill（handleNewSkill → SkillGenerator.generate）
-    - Step 1: STEP1_SKILL_MD_PROMPT → 生成 SKILL.md
-    - Step 2: STEP2_SCRIPTS_PROMPT → 提取脚本
-              STEP2B_REFS_PROMPT → 提取引用文档
-    - Step 3: STEP3_EVALS_PROMPT → 生成测试用例
-    - 验证（SkillValidator）
-    - 写入 DB + 文件系统
-  ↓
-[4B] 有匹配 → 升级已有 Skill（handleExistingSkill → SkillUpgrader.upgrade）
-    - UPGRADE_EVAL_PROMPT → 判断升级价值
-    - 升级类型：refine | extend | fix
-    - UPGRADE_PROMPT → 合并生成新版本 SKILL.md
-    - 重建附属文件
-    - 验证 → 保存新版本，版本号 +1
-  ↓
-[5] 安装（SkillInstaller）
-    - 决定安装模式：inline / on_demand / install_recommended
-    - 构建附属文件清单
+Stage 1: FTS + 向量搜索（cosine 下限 0.35）
+  → 融合得分 = 0.7 × 向量分 + 0.3 × FTS 分
+  → 取 top 10
+
+Stage 2: LLM Judge（从 top 10 中选出真正匹配的 1 个）
 ```
 
-### 5.3 相关文件
+**Skill Relevance Judge Prompt**：
 
-| 文件 | 职责 |
-|------|------|
-| `src/skill/evolver.ts` | 总调度器 |
-| `src/skill/evaluator.ts` | 评估是否值得创建/升级 |
-| `src/skill/generator.ts` | 从任务生成新 Skill |
-| `src/skill/upgrader.ts` | 升级已有 Skill |
-| `src/skill/validator.ts` | 质量验证（0-10 分） |
-| `src/skill/installer.ts` | 安装管理 |
+```
+You are a strict judge: decide whether a completed TASK should be merged
+into an EXISTING SKILL. The task and the skill must be in the SAME
+domain/topic — e.g. same type of problem, same tool, same workflow.
+Loose or tangential relevance is NOT enough.
 
-### 5.4 Skill 数据模型
+TASK TITLE: ${taskTitle}
 
-**数据库（SQLite）**：
+TASK SUMMARY:
+${taskSummary}
+
+CANDIDATE SKILLS (index, name, description):
+${skillList}
+
+RULES:
+- Output exactly ONE skill index (1 to N) ONLY if the task's experience
+  clearly belongs to that skill's domain.
+- If no skill is clearly relevant, output 0. When in doubt, output 0.
+- Do not force a match.
+
+LANGUAGE RULE: "reason" MUST use the SAME language as the task title/summary.
+
+Reply with JSON only:
+{"selectedIndex": 0, "reason": "brief explanation (same language as input)"}
+```
+
+**参数**：`temperature: 0`，`max_tokens: 256`
+
+**分支逻辑**：
+- `selectedIndex > 0` → 有匹配 → 走升级路径（Step 7b）
+- `selectedIndex == 0` 且 `preferUpgradeExisting=true` → 尝试 name similarity 二次搜索
+- 无匹配 → 走创建路径（Step 7a）
+
+### 6.4 Step 6a — 创建评估 Prompt（CREATE_EVAL_PROMPT）
+
+```
+You are a strict experience evaluation expert. Based on the completed task
+record below, decide whether this task contains **reusable, transferable**
+experience worth distilling into a "skill".
+
+A skill is a reusable guide that helps an AI agent handle **the same type
+of task** better in the future.
+
+STRICT criteria — must meet ALL of:
+1. **Repeatable**: The task type is likely to recur
+2. **Transferable**: The approach would help others facing the same problem
+3. **Technical depth**: Contains non-trivial steps, commands, code, configs,
+   or diagnostic reasoning
+
+Worth distilling (at least ONE):
+- Solves a recurring technical problem with a specific approach/workflow
+- Went through trial-and-error — the learning is valuable
+- Involves non-obvious usage of specific tools, APIs, or frameworks
+- Contains debugging/troubleshooting with diagnostic reasoning
+- Shows how to combine multiple tools/services
+- Contains deployment, configuration, or infrastructure setup steps
+- Demonstrates a reusable data processing or automation pipeline
+
+NOT worth distilling (if ANY matches → shouldGenerate=false):
+- Pure factual Q&A with no process
+- Single-turn simple answers with no workflow
+- Conversation too fragmented or incoherent
+- One-off personal tasks: identity confirmation, preference setting
+- Casual chat, opinion discussion, brainstorming without actionable output
+- Simple information lookup or summarization
+- Organizing/listing personal information
+- Generic product/system overviews without specific operational steps
+- Tasks where the "steps" are just the AI answering questions
+
+Task title: {TITLE}
+Task summary:
+{SUMMARY}
+
+LANGUAGE RULE: reason in same language as input.
+Only "suggestedName" stays in English kebab-case.
+
+Reply in JSON only:
+{
+  "shouldGenerate": boolean,
+  "reason": "brief explanation",
+  "suggestedName": "kebab-case-name",
+  "suggestedTags": ["tag1", "tag2"],
+  "confidence": 0.0-1.0
+}
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 1024`，`timeout: 30s`
+
+**输入**：task.title + task.summary（截断到 3000 字符）
+
+**门槛**：`shouldGenerate && confidence >= 0.7`（默认 minConfidence = 0.7）
+
+### 6.5 Step 6b — 升级评估 Prompt（UPGRADE_EVAL_PROMPT）
+
+```
+You are a skill upgrade evaluation expert.
+
+Existing skill (v{VERSION}):
+Name: {SKILL_NAME}
+Content:
+{SKILL_CONTENT}
+
+Newly completed task:
+Title: {TITLE}
+Summary:
+{SUMMARY}
+
+Does the new task bring substantive improvements to the existing skill?
+
+Worth upgrading (any one qualifies):
+1. Faster — shorter path discovered
+2. More elegant — cleaner, follows best practices better
+3. More convenient — fewer dependencies or complexity
+4. Fewer tokens — less exploration/trial-and-error needed
+5. More accurate — corrects wrong parameters/steps
+6. More robust — adds edge cases, error handling
+7. New scenario — covers a variant the old skill didn't
+8. Fixes outdated info — old skill has stale information
+
+NOT worth upgrading:
+- New task is identical to existing skill
+- New task's approach is worse
+- Differences are trivial
+
+LANGUAGE RULE: "reason" and "mergeStrategy" same language as input.
+
+Reply in JSON only:
+{
+  "shouldUpgrade": boolean,
+  "upgradeType": "refine" | "extend" | "fix",
+  "dimensions": ["faster", "more_elegant", ...],
+  "reason": "what new value the task brings",
+  "mergeStrategy": "which specific parts need updating",
+  "confidence": 0.0-1.0
+}
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 1024`，`timeout: 30s`
+
+**输入**：Skill 内容截断到 4000 字符，task summary 截断到 3000 字符
+
+**分支**：
+- `shouldUpgrade && confidence >= 0.7` → 走升级路径
+- `confidence < 0.3` → 低相关性逃逸，改走创建路径
+- 其余 → 关联任务但不升级
+
+---
+
+## 七、Step 7a — Skill 生成（Generator）
+
+文件：`src/skill/generator.ts`
+
+### 7.1 预处理
+
+**敏感数据脱敏**（`redactSensitive`）：
+- `sk-[20+字符]` → `sk-***REDACTED***`
+- `Bearer [20+字符]` → `Bearer ***REDACTED***`
+- `AKIA[16字符]` → `AKIA***REDACTED***`
+- `api_key/secret/token/password = "..."` → `="***REDACTED***"`
+- `/Users/<username>/` → `/Users/****/`
+
+**Tool 输出截断**：每个 tool chunk 最多 1500 字符（60% 头部 + 30% 尾部 + 截断提示）。
+
+**语言检测**：CJK 字符比例 > 15% → 中文，否则英文。
+
+### 7.2 Step 1: 生成 SKILL.md（STEP1_SKILL_MD_PROMPT）
+
+```
+You are a Skill creation expert. Your job is to distill a completed task's
+execution record into a reusable SKILL.md file.
+
+This Skill is special: it comes from real execution experience — every step
+was actually run, every pitfall was actually encountered and resolved.
+
+## Core principles
+
+### Progressive disclosure
+- frontmatter description (~100 words): ALWAYS in agent's context,
+  must be self-sufficient for deciding whether to use this skill
+- SKILL.md body: loaded when triggered, keep under 400 lines
+- Large configs/scripts → reference, don't inline
+
+### Description as trigger mechanism
+The description field decides whether the agent activates this skill.
+Write it "proactively":
+- Don't just say what it does — list situations, keywords, phrasings
+  that should trigger it
+- Bad: "How to deploy Node.js to Docker"
+- Good: "How to containerize and deploy a Node.js application using Docker.
+  Use when the user mentions Docker deployment, Dockerfile writing,
+  container builds, multi-stage builds, port mapping, .dockerignore,
+  image optimization, CI/CD container pipelines, or any task involving
+  packaging a Node/JS backend into a container — even if they don't say
+  'Docker' explicitly but describe wanting to 'package the app for
+  production' or 'run it anywhere'."
+
+### Writing style
+- Imperative form
+- Explain WHY for each step, not just HOW
+- ALWAYS or NEVER in caps is a yellow flag — rephrase with reasoning
+- Generalize from the specific task
+- Keep real commands/code/config — these are verified to work
+
+### Language matching (CRITICAL)
+Write the ENTIRE skill in the SAME language as the user's messages.
+"name" field stays English kebab-case (machine identifier).
+
+## Output format
+
+---
+name: "{NAME}"
+description: "{60-120 words, proactive trigger description}"
+metadata: { "openclaw": { "emoji": "{emoji}" } }
+---
+
+# {Title}
+{What this skill helps you do and why}
+
+## When to use this skill
+{2-4 bullet points}
+
+## Steps
+{Numbered steps from the task record}
+
+## Pitfalls and solutions
+{❌ Wrong → Why → ✅ Correct}
+
+## Key code and configuration
+{Verified code blocks}
+
+## Environment and prerequisites
+{Versions, dependencies, permissions}
+
+## Companion files
+{List of scripts/ and references/}
+
+## Task record
+Task title: {TITLE}
+Task summary: {SUMMARY}
+Conversation highlights: {CONVERSATION}
+```
+
+**参数**：`temperature: 0.2`，`max_tokens: 6000`，`timeout: 120s`
+
+**输入**：task.summary（5000 字符）+ conversation text（12000 字符）
+
+**后处理**：去掉第一个 `---` 之前的任何文本。
+
+### 7.3 Step 2: Scripts + References（并行）
+
+两个 LLM 调用通过 `Promise.all` 并行执行：
+
+**Scripts Prompt**：
+
+```
+Based on the following SKILL.md and task record, extract reusable
+automation scripts.
+
+Rules:
+- Only extract if the task record contains concrete shell commands,
+  Python scripts, or TypeScript code that form a complete, reusable automation
+- Each script must be self-contained and runnable
+- If no automatable scripts, return empty array
+- Don't fabricate scripts — only extract what was actually used
+- Script should COMPLEMENT the SKILL.md, not duplicate it
+
+Reply with a JSON array only:
+[
+  { "filename": "deploy.sh", "content": "#!/bin/bash\n..." }
+]
+
+If no scripts: reply with []
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 3000`，`timeout: 120s`
+
+**References Prompt**：
+
+```
+Based on the following SKILL.md and task record, extract reference
+documentation worth preserving.
+
+Rules:
+- Only extract if the task involved important API docs, configuration
+  references, or technical notes
+- Each reference should be a standalone markdown document
+- Don't duplicate what's in SKILL.md
+- LANGUAGE RULE: Same language as SKILL.md and task record
+
+Reply with a JSON array only:
+[
+  { "filename": "api-notes.md", "content": "# API Reference\n..." }
+]
+
+If no references: reply with []
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 3000`，`timeout: 120s`
+
+### 7.4 Step 3: Evals 生成（STEP3_EVALS_PROMPT）
+
+```
+Based on the following skill, generate realistic test prompts that
+should trigger this skill.
+
+Requirements:
+- Write 3-4 test prompts that a real user would type
+- Mix of direct and indirect phrasings
+- Include realistic details: file paths, project names, error messages
+- Mix formal and casual tones, include some with typos or shorthand
+- Each prompt should be complex enough that the agent would need the skill
+- Write expectations that are specific and verifiable
+- LANGUAGE RULE: Same language as skill content
+
+Reply with a JSON array only:
+[
+  {
+    "id": 1,
+    "prompt": "A realistic user message",
+    "expectations": ["Expected behavior 1", "Expected behavior 2"],
+    "trigger_confidence": "high|medium"
+  }
+]
+```
+
+**参数**：`temperature: 0.3`，`max_tokens: 2000`，`timeout: 120s`
+
+### 7.5 Step 4: Eval 验证
+
+**不用 LLM** — 用 RecallEngine 对每个 eval prompt 做搜索，检查该 Skill 是否能被检索到（`minScore: 0.3`，`topScore >= 0.4`）。
+
+### 7.6 持久化
+
+```
+{stateDir}/skills-store/{skill-name}/
+  ├── SKILL.md
+  ├── scripts/
+  ├── references/
+  └── evals/evals.json
+
+qualityScore < 6 → status = "draft"
+qualityScore >= 6 → status = "active"
+```
+
+---
+
+## 八、Step 7b — Skill 升级（Upgrader）
+
+文件：`src/skill/upgrader.ts`
+
+### 8.1 升级 Prompt（UPGRADE_PROMPT）
+
+```
+You are a Skill upgrade expert. You're merging new real-world execution
+experience into an existing Skill to make it better.
+
+Remember: this is based on ACTUAL execution — the new task was really run,
+errors were really encountered and fixed.
+
+## Core principles
+[与 Generator 相同的 progressive disclosure、trigger description、writing style 原则]
+
+## Existing skill (v{VERSION}):
+{SKILL_CONTENT}
+
+## Upgrade context
+- Type: {UPGRADE_TYPE}
+- Dimensions improved: {DIMENSIONS}
+- Reason: {REASON}
+- Merge strategy: {MERGE_STRATEGY}
+
+## New task record
+Title: {TITLE}
+Summary: {SUMMARY}
+
+## Merge rules
+1. Preserve all valid core content from existing skill
+2. Merge new experience strategically:
+   - Better approach → replace old, keep old as "Alternative" if still valid
+   - New scenario → add new section (don't replace unrelated content)
+   - Bug/error corrected → replace directly, add to "Pitfalls"
+   - Performance improvement → update steps, note improvement
+3. Update description if new scenarios/keywords/triggers needed
+4. Update "When to use this skill" if new use cases revealed
+5. Append new pitfalls to existing section
+6. Total length ≤ 400 lines
+7. Add version comment:
+   <!-- v{NEW_VERSION}: {one-line change note} (from task: {TASK_ID}) -->
+
+## Output format
+Output the complete upgraded SKILL.md, then:
+---CHANGELOG---
+{one-line changelog title}
+---CHANGE_SUMMARY---
+{3-5 sentence summary}
+```
+
+**参数**：`temperature: 0.2`，`max_tokens: 6000`，`timeout: 90s`
+
+**输入**：Skill 内容（6000 字符）+ task summary（4000 字符）
+
+### 8.2 附属文件重建
+
+升级后执行 3 个并行 LLM 调用重建附属文件（Prompt 结构与 Generator 的 Step 2-3 相同）：
+
+| 文件 | temperature | max_tokens | timeout |
+|---|---|---|---|
+| Scripts rebuild | 0.1 | 3000 | 60s |
+| Evals rebuild | 0.3 | 2000 | 60s |
+| Refs rebuild | 0.1 | 3000 | 60s |
+
+### 8.3 回退机制
+
+```
+升级前 → 备份 Skill 目录
+  → LLM 生成新内容
+  → 写入新 SKILL.md + 重建附属文件
+  → Validator 验证（含回归检查：新内容比旧内容缩水 >30% → warning）
+  → 验证失败 → 从备份恢复整个目录
+  → 验证通过 → 持久化新版本（version +1）
+```
+
+---
+
+## 九、Step 8 — 质量验证（Validator）
+
+文件：`src/skill/validator.ts`
+
+### 9.1 验证阶段
+
+**阶段 1 — 格式验证**（不用 LLM）：
+- SKILL.md 必须存在且非空
+- 必须有 YAML frontmatter（`---...---`）
+- 必须有 `name` 字段（max 64 字符，kebab-case 警告）
+- 必须有 `description` 字段（max 1024 字符警告）
+- 行数 vs `skillMaxLines`（默认 400）
+- 内容 < 200 字符 → 警告
+
+**阶段 2 — 回归检查**（升级时，不用 LLM）：
+- 新内容比旧内容缩水 > 30%（且旧内容 > 20 行）→ 警告
+- 检测缺失的 `##` 章节（按名称对比）
+
+**阶段 3 — 附属文件一致性**（不用 LLM）：
+- SKILL.md 引用的 `scripts/X` 和 `references/X` 必须在磁盘上存在
+- 磁盘上未被引用的孤立文件 → 警告
+- `evals/evals.json` 结构验证
+
+**阶段 4 — 密钥扫描**（不用 LLM）：
+- `sk-[20+字符]`、`Bearer [20+字符]`、`AKIA[16字符]`
+- `api_key/secret/token/password = "..."`
+- Base64 字符串（40+ 字符）
+
+**阶段 5 — LLM 质量评分**：
+
+```
+You are a skill quality reviewer. Evaluate the following SKILL.md
+and give a score from 0 to 10.
+
+Criteria:
+1. Clarity: Are the steps clear and actionable? (0-2 pts)
+2. Completeness: Does it cover scenarios, pitfalls, and key code? (0-2 pts)
+3. Reusability: Can this skill be applied to similar future tasks? (0-2 pts)
+4. Accuracy: Are commands, code, and configurations correct? (0-2 pts)
+5. Structure: Is the format well-organized with proper sections? (0-2 pts)
+
+LANGUAGE RULE: strengths/weaknesses/suggestions same language as SKILL.md.
+
+Reply in JSON only:
+{
+  "score": 0-10,
+  "strengths": ["..."],
+  "weaknesses": ["..."],
+  "suggestions": ["..."]
+}
+```
+
+**参数**：`temperature: 0.1`，`max_tokens: 1024`
+
+**质量阈值**：`score < 6` → Skill 标记为 "draft"
+
+---
+
+## 十、Skill 召回与注入
+
+文件：`index.ts`（before_prompt_build hook）
+
+### 10.1 完整召回流程
+
+```
+用户消息
+  │
+  ▼
+[1] normalizeAutoRecallQuery（确定性清洗，不用 LLM）
+    - 去掉 Sender metadata 块
+    - 去掉 HTML 标签
+    - 去掉 session startup 样板
+    - 去掉 "Current time:..." 行
+    - 去掉 internal context
+    - 去掉 continuation prompt
+    结果 < 2 字符 → 跳过召回
+  │
+  ▼
+[2] 并行搜索
+    ├── 本地引擎：engine.search({ query, maxResults: 10, minScore: 0.45 })
+    └── Hub 远程搜索（如果启用 sharing）
+  │
+  ▼
+[3] 无结果？
+    ├── 尝试 Skill 搜索 → 有 Skill → 注入 Skill 提示
+    └── query > 50 字符 → 注入"必须调用 memory_search"的强制提示
+  │
+  ▼
+[4] LLM 相关性过滤（FILTER_RELEVANT_PROMPT）                🤖 LLM
+  │
+  ▼
+[5] 去重（>70% 词汇重叠 → 去掉）
+  │
+  ▼
+[6] 组装注入块 → 返回 { prependContext: context }
+```
+
+### 10.2 相关性过滤 Prompt
+
+```
+You are a memory relevance judge.
+
+Given a QUERY and CANDIDATE memories, decide: does each candidate's content
+contain information that would HELP ANSWER the query?
+
+CORE QUESTION: "If I include this memory, will it help produce a better answer?"
+- YES -> include
+- NO -> exclude
+
+RULES:
+1. Relevant if content provides facts, context, or data that directly
+   supports answering the query.
+2. Merely shares same broad topic but NO useful information → NOT relevant.
+3. If NO candidate can help, return {"relevant":[],"sufficient":false}
+   — do NOT force-pick the "least irrelevant" one.
+4. DEDUPLICATION: When multiple candidates convey same information,
+   keep ONLY the most complete/detailed one.
+
+OUTPUT — JSON only:
+{"relevant":[1,3],"sufficient":true}
+```
+
+**参数**：`temperature: 0`，`max_tokens: 200`
+
+### 10.3 注入格式
+
+**记忆注入块**：
+
+```
+## User's conversation history (from memory system)
+
+IMPORTANT: The following are facts from previous conversations with this user.
+You MUST treat these as established knowledge and use them directly when answering.
+
+1. [user]
+   {excerpt}
+   chunkId="{id}"
+   task_id="{taskId}"
+
+Available follow-up tools:
+- A hit has `task_id` → call `task_summary(taskId="...")` for full context
+- A task may have a reusable guide → call `skill_get(taskId="...")` for skill
+- Need surrounding dialogue → call `memory_timeline(chunkId="...")`
+```
+
+**Skill 注入块**（追加在记忆之后）：
+
+```
+## Relevant skills from past experience
+
+The following skills were distilled from similar previous tasks.
+You SHOULD call `skill_get` to retrieve the full guide before attempting the task.
+
+1. **{name}** [installed] — {description}
+   → call `skill_get(skillId="{id}")`
+```
+
+**不足提示**（如果 sufficient=false）：
+
+```
+If these memories don't fully answer the question, call `memory_search`
+with a shorter or rephrased query to find more.
+```
+
+---
+
+## 十一、Skill 存储与文件系统
+
+### 11.1 SKILL.md 格式
+
+```markdown
+---
+name: deploy-docker-app
+description: >
+  How to containerize and deploy a Node.js application using Docker.
+  Use when the user mentions Docker deployment, Dockerfile writing,
+  container builds, multi-stage builds, port mapping...
+metadata:
+  openclaw:
+    emoji: "🐳"
+---
+
+# Deploy Docker App
+One sentence: what this skill helps you do.
+
+## When to use this skill
+- ...
+
+## Steps
+1. ...
+
+## Pitfalls and solutions
+❌ Wrong → ✅ Correct
+
+## Key code and configuration
+```
+
+### 11.2 文件系统结构
+
+```
+{stateDir}/skills-store/{skill-name}/
+  ├── SKILL.md           # 主文档（YAML frontmatter + 内容）
+  ├── scripts/           # 可执行脚本
+  ├── references/        # 参考文档
+  └── evals/evals.json   # 测试用例
+```
+
+### 11.3 数据模型
 
 ```typescript
 interface Skill {
   id: string;
-  name: string;                    // kebab-case，如 "deploy-docker-app"
-  description: string;             // 60-120 词，用于触发匹配
+  name: string;                    // kebab-case
+  description: string;
   version: number;                 // 每次升级 +1
   status: "active" | "archived" | "draft";
   tags: string;                    // JSON 数组
   sourceType: "task" | "manual";
-  dirPath: string;                 // 文件系统路径
-  installed: number;               // 是否已安装
+  dirPath: string;
+  installed: number;
   owner: string;
-  visibility: "private" | "public";
   qualityScore: number | null;     // 0-10
   createdAt: number;
   updatedAt: number;
@@ -392,219 +1198,410 @@ interface SkillVersion {
 }
 ```
 
-**文件系统**：
+### 11.4 安装机制
 
-```
-{stateDir}/skills-store/{skill-name}/
-  ├── SKILL.md          # 主文档（YAML frontmatter + 内容）
-  ├── scripts/          # 可执行脚本
-  ├── references/       # 补充文档
-  └── evals/evals.json  # 测试用例
-```
+`SkillInstaller` 没有 LLM 调用，纯文件操作：
 
-### 5.5 Skill 进化机制
+- `install(skillId)` → 复制到 `{workspaceDir}/skills/{skillName}/`，标记 installed
+- `uninstall(skillId)` → 删除 workspace 副本，标记 uninstalled
+- `syncIfInstalled(skillName)` → 升级后重新复制（如果已安装）
 
-每个 Skill 保留完整版本历史：
+**自动安装判断**（heuristic）：
+- 3+ 可执行脚本，或
+- 2+ 大文件（>5KB），或
+- 总附属文件 > 20KB
 
-| 升级类型 | 含义 |
-|----------|------|
-| `create` | 新建 |
-| `refine` | 改进清晰度、修正错误、更优方案 |
-| `extend` | 扩展场景、增加适用范围 |
-| `fix` | 修正过时/错误信息 |
+### 11.5 默认配置
 
-进化内容包括：
-- description 更新（新增触发关键词/场景）
-- procedure 丰富（补充边界情况）
-- pitfalls 扩展（新增遇到的失败模式）
-- examples 更新（真实输出样例）
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `skillEvolutionEnabled` | `true` | 开启 Skill 进化 |
+| `skillAutoEvaluate` | `true` | 自动评估任务 |
+| `skillMinChunksForEval` | `6` | 最少 chunk 数 |
+| `skillMinConfidence` | `0.7` | 最低置信度 |
+| `skillMaxLines` | `400` | SKILL.md 最大行数 |
+| `skillAutoInstall` | `false` | 不自动安装 |
+| `skillAutoRecall` | `true` | 自动召回 |
+| `skillAutoRecallLimit` | `2` | 最多注入 2 个 Skill |
+| `skillPreferUpgrade` | `true` | 优先升级而非新建 |
+| `skillRedactSensitive` | `true` | 脱敏敏感数据 |
 
 ---
 
-## 六、Python 端 Skill 处理
+## 十二、Python 端处理管线
 
-核心文件：
-- `src/memos/templates/skill_mem_prompt.py` — 所有 prompt 模板
-- `src/memos/mem_reader/read_skill_memory/process_skill_memory.py` — 主处理管线
+文件：`src/memos/templates/skill_mem_prompt.py`、`src/memos/mem_reader/read_skill_memory/process_skill_memory.py`
 
-### 6.1 与 TS 端的区别
-
-| | Python 端 | TS 端 |
-|---|-----------|-------|
-| 时机 | 对话结束后批量处理 | 实时增量，任务 finalize 时触发 |
-| 主题分割 | 一次性把全部消息按主题聚类 | 逐 turn 线性判断 |
-| 非连续任务 | 支持回溯（A→B→A 归为同一主题） | 线性切割，不回溯 |
-| Skill 提取 | 两阶段（简单 + 详细） | 评估 → 生成/升级 |
-| Prompt | `TASK_CHUNKING_PROMPT` 等 | `CREATE_EVAL_PROMPT` 等 |
-
-### 6.2 处理流程
+### 12.1 整体流程
 
 ```
 对话消息（全量）
-  ↓
-Phase 1: 任务分块（_split_task_chunk_by_llm）
-  - TASK_CHUNKING_PROMPT / TASK_CHUNKING_PROMPT_ZH
-  - 将消息按独立任务分组（支持非连续）
-  - 过滤闲聊
-  ↓
-Phase 2: 召回相关 Skill（_recall_related_skill_memories）
-  - TASK_QUERY_REWRITE_PROMPT → 重写查询
-  - 搜索 top-5 相关已有 SkillMemory
-  ↓
-Phase 3A: 简单提取（_extract_skill_memory_by_llm）
-  - SKILL_MEMORY_EXTRACTION_PROMPT
-  - 输出：name, description, procedure, experience, preference, examples, tags
-  ↓
-Phase 3B: 详细提取（_extract_skill_memory_by_llm_md）
-  - SKILL_MEMORY_EXTRACTION_PROMPT_MD（增加 trigger 关键词）
-  - 并行生成附加内容：
-    - SCRIPT_GENERATION_PROMPT → 可执行脚本
-    - TOOL_GENERATION_PROMPT → 推荐工具
-    - OTHERS_GENERATION_PROMPT → 补充文档
+    │
+    ▼
+[Step 1] 消息重建 + 预处理
+    - TextualMemoryItem → 平铺 {role, content} 列表
+    - 截断 chat_history 到最近 20 条
+    - 给每条消息加 idx 编号
+    │
+    ▼
+[Step 2] 任务分块                                           🤖 LLM
+    - TASK_CHUNKING_PROMPT / _ZH
+    - 支持非连续消息归组（跳跃式对话）
+    - 过滤闲聊
+    │
+    ▼
+[Step 3] 召回相关 Skill（并行，max 5 workers）
+    - 先查询改写                                             🤖 LLM
+      TASK_QUERY_REWRITE_PROMPT / _ZH
+    - 再搜索 top-5 相关已有 SkillMemory
+    │
+    ▼
+[Step 4] Skill 提取（两种模式）
+    │
+    ├── 简单模式                                             🤖 LLM
+    │   SKILL_MEMORY_EXTRACTION_PROMPT / _ZH
+    │   → 输出完整 Skill JSON（含 scripts 代码）
+    │
+    └── 完整模式（默认）
+        ├── Phase 1: 提取 Skill 骨架                         🤖 LLM
+        │   SKILL_MEMORY_EXTRACTION_PROMPT_MD / _ZH
+        │   → 输出 Skill JSON（scripts 为 TODO 列表）
+        │
+        └── Phase 2: 详细生成（并行）
+            ├── scripts → SCRIPT_GENERATION_PROMPT            🤖 LLM
+            ├── tools → TOOL_GENERATION_PROMPT                🤖 LLM
+            └── others → OTHERS_GENERATION_PROMPT / _ZH       🤖 LLM
+    │
+    ▼
+[Step 5] 文件写入
+    - SKILL.md（YAML frontmatter + sections）
+    - scripts/ 目录
+    - reference/ 目录
+    - 打包 {skill-name}.zip
+    │
+    ▼
+[Step 6] 上传 + 注册
+    - 上传到 OSS 或 Local 存储
+    - 如果是 update → 删除旧 zip + 旧图谱记录
+    - 创建 TextualMemoryItem（嵌入 description 向量）
+    - 注册到 MySQL
 ```
 
-### 6.3 Prompt 清单
+### 12.2 任务分块 Prompt（TASK_CHUNKING_PROMPT）
 
-| Prompt | 文件行号 | 用途 | 输出 |
-|--------|----------|------|------|
-| `TASK_CHUNKING_PROMPT` | L1-33 | 消息按任务分组 | `{task_id, task_name, message_indices[]}` |
-| `TASK_CHUNKING_PROMPT_ZH` | L36-67 | 中文版 | 同上 |
-| `SKILL_MEMORY_EXTRACTION_PROMPT` | L69-143 | 提取 Skill | JSON: name, description, procedure 等 |
-| `SKILL_MEMORY_EXTRACTION_PROMPT_ZH` | L146-227 | 中文版 | 同上 |
-| `SKILL_MEMORY_EXTRACTION_PROMPT_MD` | L230-300 | 增强提取（含 trigger） | JSON + trigger 字段 |
-| `SKILL_MEMORY_EXTRACTION_PROMPT_MD_ZH` | L303-373 | 中文版 | 同上 |
-| `TASK_QUERY_REWRITE_PROMPT` | L376-400 | 重写搜索查询 | 单字符串 |
-| `TASK_QUERY_REWRITE_PROMPT_ZH` | L403-427 | 中文版 | 同上 |
-| `SCRIPT_GENERATION_PROMPT` | L433-461 | 生成 Python 脚本 | `{filename: code}` |
-| `TOOL_GENERATION_PROMPT` | L463-488 | 识别所需工具 | JSON 工具名数组 |
-| `OTHERS_GENERATION_PROMPT` | L490-534 | 生成补充文档 | Markdown |
+```
+# Context (Conversation Records)
+{{messages}}
 
-### 6.4 Python 端 Skill 数据模型
+# Role
+You are an expert in NLP and dialogue logic analysis. You excel at
+organizing logical threads from complex long conversations and accurately
+extracting users' core intentions to segment the dialogue into distinct tasks.
+
+# Task
+Analyze the provided conversation records, identify all independent "tasks",
+and assign the corresponding dialogue message indices to each task.
+
+**Note**: Tasks should be high-level and general. Group similar activities
+under broad themes such as "Travel Planning", "Code Review", "Data Analysis".
+
+# Rules & Constraints
+1. **Task Independence**: Completely unrelated topics → different tasks.
+2. **Main Task and Subtasks**: If a subtask serves a primary objective
+   (e.g., "checking weather" within "Travel Planning"), do NOT separate it.
+   **Only split when truly independent and unrelated.**
+3. **Non-continuous Processing**: Identify "jumping" conversations.
+   e.g., messages 8-11 = Travel, 12-22 = other, 23-24 = Travel again
+   → both [8,11] and [23,24] go to "Travel Planning".
+4. **Filter Chit-chat**: Only extract tasks with clear goals.
+5. **Output Format**: Strict JSON.
+6. **Language Consistency**: task_name matches conversation language.
+7. **Generic Task Names**: "Travel Planning" not "Planning a 5-day trip to Chengdu".
+
+```json
+[
+  {
+    "task_id": 1,
+    "task_name": "Generic task name",
+    "message_indices": [[0, 5], [16, 17]],
+    "reasoning": "Brief logic explanation"
+  }
+]
+```
+```
+
+**重试**：最多 3 次，含 JSON 清洗（去掉 ````json` 围栏）。
+
+### 12.3 查询改写 Prompt（TASK_QUERY_REWRITE_PROMPT）
+
+```
+# Role
+You are an expert in understanding user intentions.
+
+# Task
+Based on the task type and conversation messages, rewrite into a clear,
+concise task query string.
+
+# Requirements
+1. Analyze conversation to understand core intention
+2. Consider task type as context
+3. Extract and summarize key task objective
+4. Output one sentence
+5. Same language as conversation
+6. Focus on WHAT, not HOW
+7. No explanations, just output the string
+
+# Output
+Output only the rewritten task query string.
+```
+
+### 12.4 Skill 提取 Prompt — 简单版（SKILL_MEMORY_EXTRACTION_PROMPT）
+
+输出字段：`name, description, procedure, experience, preference, examples, tags, scripts, others, update, old_memory_id`
+
+**核心原则**：
+
+```
+1. 通用化：提取可跨场景应用的抽象方法论，避免具体细节
+2. 普适性：除 examples 外，所有字段保持通用
+3. 相似性检查：存在相似 skill → update=true + old_memory_id
+4. 语言一致性
+5. 历史使用约束：chat_history 仅作辅助上下文
+   - 只在能提供 messages 中缺失的增量信息时才使用
+   - 不得作为 skill 的主要来源
+```
+
+### 12.5 Skill 提取 Prompt — 完整版（SKILL_MEMORY_EXTRACTION_PROMPT_MD）
+
+与简单版的主要区别：
+
+| 差异 | 简单版 | 完整版（MD） |
+|---|---|---|
+| 分类字段 | `tags` | `trigger`（触发关键词列表） |
+| scripts | 实际代码 dict | TODO 列表（Phase 2 再生成） |
+| 新增字段 | 无 | `tool`（所需外部工具列表） |
+| 设计目的 | 一步到位 | 两阶段管线 |
+
+**核心额外原则**：
+
+```
+技能提取原则：
+1. 通用化：提取的技能应该持久有效，而非与特定时间绑定
+2. 相似性检查：存在相同主题的技能 → 必须用更新操作
+3. 语言一致性
+4. 历史使用约束
+
+关键指导：
+- 无法提取时返回 null
+- 同样场景尽量合并（update: true）
+  如饮食规划合并为一条，不要已有"饮食规划"又新增"生酮饮食规划"
+  因为技能是通用模版，可以添加 preference 和 trigger 来更新
+```
+
+### 12.6 详细生成 Prompt
+
+**Script Generation**：
+
+```
+# Role
+You are a Senior Python Developer and Architect.
+
+# Task
+Generate production-ready, executable Python scripts.
+
+# Instructions
+1. Completeness: Fully functional, no placeholders
+2. Robustness: Error handling + input validation
+3. Style: PEP 8, type hints
+4. Dependencies: Standard libraries first
+5. Main Guard: Include if __name__ == "__main__" with examples
+
+# Output Format
+JSON: { "filename.py": "code..." }
+```
+
+**Tool Generation**：
+
+```
+Analyze Requirements and Context to identify relevant tools from
+Available Tools. Return a list of matching tool names.
+
+Constraints:
+1. Include only if tool schema directly addresses requirements
+2. Empty tools or no match → return []
+3. Return ONLY JSON array of strings
+
+Output: ["tool_name_1", "tool_name_2"]
+```
+
+**Others Generation**：
+
+```
+Create detailed documentation for '{filename}'.
+
+Structure:
+1. Introduction: Brief overview
+2. Detailed Content: Organized with headers
+3. Key Concepts/Reference: Definitions or tables
+4. Conclusion/Next Steps
+
+Formatting: Markdown. Language: Same as context.
+Output: Markdown directly.
+```
+
+### 12.7 Python 端 Skill 数据模型
 
 ```python
 class SkillMemory(TextualMemoryMetadata):
     memory_type = "SkillMemory"
-    name: str                     # 技能名
-    description: str              # 描述
-    procedure: str                # 步骤流程
-    experience: list[str]         # 经验教训
-    preference: list[str]         # 用户偏好
-    examples: list[str]           # 输出模板
-    scripts: dict | None          # 代码片段 {filename: code}
-    others: dict | None           # 补充文档
-    url: str                      # Skill 仓库 URL
-    # 继承字段：
-    sources: list[SourceMessage]  # 来源
-    embedding: list[float]        # 向量
-    tags: list[str]               # 标签
-    status: "activated" | "archived"
-    created_at: str               # ISO 8601
-    updated_at: str               # ISO 8601
+    name: str
+    description: str
+    procedure: str              # 步骤流程
+    experience: list[str]       # 经验教训
+    preference: list[str]       # 用户偏好
+    examples: list[str]         # 输出模板
+    scripts: dict | None        # {filename: code}
+    others: dict | None         # 补充文档
+    url: str                    # Skill zip URL
+    # 继承：sources, embedding, tags, status, created_at, updated_at
 ```
+
+### 12.8 与 TS 端的主要差异总结
+
+| 维度 | TS 端 | Python 端 |
+|---|---|---|
+| **上游处理** | 实时游标 + 逐条去重 + 逐 turn 主题分割 | 全量消息 → LLM 一次性分块 |
+| **主题分割** | 线性，不支持非连续回溯 | 支持非连续（跳跃式对话） |
+| **质量门控** | Rule filter + LLM 评估 + LLM 打分(0-10) | 无独立门控，由 LLM 提取时自行判断 |
+| **Skill 搜索** | FTS + 向量 + LLM Judge 三阶段 | 查询改写 + top-5 搜索 |
+| **生成流程** | 评估 → 搜索 → 创建/升级（多步） | 一步提取（或两步：骨架 + 详细） |
+| **update 决策** | LLM Judge 判断是否同一 Skill | LLM 提取时直接返回 update=true |
+| **附属文件** | scripts + references + evals | scripts + reference + others (zip) |
+| **版本管理** | 完整版本历史（SkillVersion 表） | 覆盖式更新（old_memory_id） |
 
 ---
 
-## 七、Skill 检索与使用
+## 十三、LLM Prompt 完整清单
 
-### 7.1 检索引擎
+### TS 端
 
-文件：`src/recall/engine.ts`
+| # | Prompt 名称 | 文件 | temp | max_tokens | timeout | 用途 |
+|---|---|---|---|---|---|---|
+| 1 | Summarize | providers/*.ts | 0 | 100 | 30s | 消息摘要 |
+| 2 | DEDUP_JUDGE_PROMPT | providers/*.ts | 0 | 300 | 15s | 语义去重 |
+| 3 | TOPIC_CLASSIFIER_PROMPT | providers/*.ts | 0 | 60 | 15s | 主题分类 |
+| 4 | TOPIC_ARBITRATION_PROMPT | providers/*.ts | 0 | 10 | 15s | 主题仲裁 |
+| 5 | TASK_SUMMARY_PROMPT | providers/*.ts | 0.1 | 4096 | 60s | 任务摘要 |
+| 6 | TASK_TITLE_PROMPT | providers/*.ts | 0 | 100 | 30s | 任务标题 |
+| 7 | Skill Relevance Judge | evolver.ts | 0 | 256 | 30s | 搜索相关 Skill |
+| 8 | CREATE_EVAL_PROMPT | evaluator.ts | 0.1 | 1024 | 30s | 创建评估 |
+| 9 | UPGRADE_EVAL_PROMPT | evaluator.ts | 0.1 | 1024 | 30s | 升级评估 |
+| 10 | STEP1_SKILL_MD_PROMPT | generator.ts | 0.2 | 6000 | 120s | 生成 SKILL.md |
+| 11 | STEP2_SCRIPTS_PROMPT | generator.ts | 0.1 | 3000 | 120s | 提取脚本 |
+| 12 | STEP2B_REFS_PROMPT | generator.ts | 0.1 | 3000 | 120s | 提取参考文档 |
+| 13 | STEP3_EVALS_PROMPT | generator.ts | 0.3 | 2000 | 120s | 生成测试用例 |
+| 14 | UPGRADE_PROMPT | upgrader.ts | 0.2 | 6000 | 90s | 升级合并 |
+| 15 | Upgrader scripts rebuild | upgrader.ts | 0.1 | 3000 | 60s | 重建脚本 |
+| 16 | Upgrader evals rebuild | upgrader.ts | 0.3 | 2000 | 60s | 重建测试 |
+| 17 | Upgrader refs rebuild | upgrader.ts | 0.1 | 3000 | 60s | 重建参考 |
+| 18 | QUALITY_PROMPT | validator.ts | 0.1 | 1024 | 30s | 质量评分 |
+| 19 | FILTER_RELEVANT_PROMPT | providers/*.ts | 0 | 200 | 15s | 召回相关性过滤 |
 
-混合搜索策略：
-- **FTS 搜索**：对 skill name + description 做全文检索
-- **向量搜索**：embed query → cosine similarity
-- **融合排序**：RRF（Reciprocal Rank Fusion）+ MMR（Maximal Marginal Relevance）
-- **Scope**：`"self"`（自己的）| `"public"`（公开的）| `"mix"`（两者）
+### Python 端
 
-### 7.2 自动召回（before_prompt_build）
-
-```
-用户消息 → 搜索相关 Skill
-  → 格式化为提示注入：
-    "## Relevant skills from past experience
-     1. **skill-name** — description
-        → call `skill_get(skillId="...")` for the full guide"
-  → 返回 { prependContext: skillContext }
-```
-
-### 7.3 主动调用（registerTool）
-
-Agent 可通过注册工具主动使用：
-
-| 工具 | 作用 |
-|------|------|
-| `skill_get` | 获取完整 SKILL.md 内容 |
-| `skill_search` | 搜索相关 Skill |
-| `skill_install` | 安装 Skill 脚本到工作目录 |
-| `network_skill_pull` | 从 Hub 拉取远程 Skill |
-
-### 7.4 Hub 同步与发布
-
-文件：`src/client/skill-sync.ts`
-
-```typescript
-// 发布到 Hub
-publishSkillBundleToHub()  → 打包 SkillBundle → 上传
-
-// 从 Hub 拉取
-fetchHubSkillBundle()      → 下载
-restoreSkillBundleFromHub() → 还原到本地
-
-// SkillBundle 结构
-{
-  metadata: { id, name, description, version, qualityScore },
-  bundle: { skill_md, scripts[], references[], evals[] }
-}
-```
+| # | Prompt 名称 | temp | 用途 |
+|---|---|---|---|
+| 1 | TASK_CHUNKING_PROMPT / _ZH | — | 任务分块 |
+| 2 | TASK_QUERY_REWRITE_PROMPT / _ZH | — | 查询改写 |
+| 3 | SKILL_MEMORY_EXTRACTION_PROMPT / _ZH | — | 简单提取 |
+| 4 | SKILL_MEMORY_EXTRACTION_PROMPT_MD / _ZH | — | 完整提取 |
+| 5 | SCRIPT_GENERATION_PROMPT | — | 生成脚本 |
+| 6 | TOOL_GENERATION_PROMPT | — | 识别工具 |
+| 7 | OTHERS_GENERATION_PROMPT / _ZH | — | 生成参考文档 |
 
 ---
 
-## 八、完整数据流总览
+## 十四、关键设计洞察
+
+### 14.1 TS 端的"任务驱动"提取
+
+与 AutoSkill 的"滑动窗口"不同，MemOS TS 端是**任务驱动**的：
 
 ```
-                         ┌─────────────────────────────┐
-                         │     OpenClaw Agent Runtime    │
-                         └──────────┬──────────────────┘
-                                    │
-              ┌─────────────────────┼─────────────────────┐
-              │                     │                     │
-     before_prompt_build       Agent 运行中            agent_end
-              │                     │                     │
-    ┌─────────▼──────────┐  ┌──────▼───────┐    ┌───────▼────────┐
-    │ 自动召回记忆/Skill  │  │ 主动调用工具  │    │  游标增量提取   │
-    │ → 注入 prompt      │  │ memory_search │    │  sessionMsgCursor│
-    └────────────────────┘  │ skill_get     │    └───────┬────────┘
-                            │ skill_install │            │
-                            └──────────────┘    ┌───────▼────────┐
-                                                │ captureMessages │
-                                                │   消息清洗       │
-                                                └───────┬────────┘
-                                                        │
-                                                ┌───────▼────────┐
-                                                │  IngestWorker   │
-                                                │  摘要+向量+去重  │
-                                                │  → SQLite 存储   │
-                                                └───────┬────────┘
-                                                        │
-                                                ┌───────▼────────┐
-                                                │ TaskProcessor   │
-                                                │ 增量主题分割     │
-                                                │ 时间/Session/LLM │
-                                                └───────┬────────┘
-                                                        │
-                                                  主题切换时
-                                                        │
-                                                ┌───────▼────────┐
-                                                │  finalizeTask   │
-                                                │  生成任务摘要    │
-                                                └───────┬────────┘
-                                                        │
-                                                ┌───────▼────────┐
-                                                │  SkillEvolver   │
-                                                │  Rule Filter    │
-                                                │  LLM 评估       │
-                                                │  搜索已有 Skill  │
-                                                │  创建 / 升级     │
-                                                │  验证 + 安装     │
-                                                └────────────────┘
+AutoSkill: 每轮取 messages[-6:] → 提取 → 下一轮    （窗口驱动）
+MemOS:     累积消息 → 主题切换时 finalize → 提取     （任务驱动）
+```
+
+- AutoSkill 的优势：延迟低，每轮都可能提取，渐进进化
+- MemOS 的优势：有完整任务上下文，提取质量更高，不会跨任务混合
+
+### 14.2 Python 端的"非连续回溯"
+
+```
+AutoSkill: 线性窗口，不回溯
+MemOS TS:  线性切割，不回溯
+MemOS Py:  LLM 聚类，支持非连续回溯
+
+例：messages 8-11 = 旅行, 12-22 = 编程, 23-24 = 旅行
+MemOS Py: [8-11, 23-24] → "旅行规划" 同一个任务
+MemOS TS: [8-11] → 任务1, [12-22] → 任务2, [23-24] → 可能新任务3
+```
+
+### 14.3 "通用化"原则
+
+MemOS 最强调的设计原则。所有 Prompt 都反复要求：
+
+```
+- "Travel Planning" 而非 "Beijing Travel Planning"
+- 提取可跨场景应用的抽象方法论
+- 除 examples 外所有字段保持通用
+- 同场景合并：不要已有"饮食规划"又新增"生酮饮食规划"
+```
+
+对比 AutoSkill 的"去标识化"（placeholder 替换），MemOS 的通用化更激进——不只是去掉实体名，而是要求把整个方法论抽象到可复用的层次。
+
+### 14.4 两级触发机制（TS 端）
+
+```
+L0: description（始终在上下文中，~100 词）
+    → 决定是否触发 Skill
+L1: SKILL.md 完整内容（触发后加载）
+    → 提供完整指导
+L2: scripts/ references/（按需加载）
+    → 可执行资源
+```
+
+这与 Anthropic 官方 Skill-Creator 和 Superpowers 的三级加载架构一致。description 的写法是"proactive trigger"——不只描述做什么，还要列出所有应该触发的场景和关键词。
+
+### 14.5 质量门控差异
+
+```
+AutoSkill:  提取 → decide(add/merge/discard) → 能力身份判断 → 合并
+            无独立质量评分，靠 decide 阶段的 LLM 判断
+
+MemOS TS:   Rule filter → LLM 评估(0-1 confidence) → 生成 → 验证(0-10 score)
+            score < 6 → draft（不会被自动注入）
+            升级时有回归检查（缩水 >30% → 警告 → 可回退）
+
+MemOS Py:   无独立质量门控
+            由 LLM 提取时自行判断 null（无法提取）
+```
+
+### 14.6 证据使用对比
+
+```
+AutoSkill:
+  USER turns = 证据来源（source of truth）
+  ASSISTANT turns = 仅参考上下文
+  弱确认 ≠ 验证
+
+MemOS TS:
+  完整对话（user + assistant + tool）都是输入
+  无显式的证据溯源原则
+  但有 tool 输出截断（1500 字符）和敏感数据脱敏
+
+MemOS Py:
+  messages = 主要来源
+  chat_history = 辅助上下文（有严格使用约束）
+  不得作为 skill 的主要来源，仅补充 preference/experience
 ```
