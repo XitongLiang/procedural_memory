@@ -1121,7 +1121,71 @@ Skill "报告格式规范" v0.1.0 champion:
 
 ---
 
-## 十二、关键设计洞察
+## 十二、Agent 轨迹（Trajectory）Skill 提取
+
+**干什么**：以 Agent 执行轨迹（用户消息 + 工具调用 + 环境反馈 + 多轮推理）为输入，提取可复用的工作流 Skill。与对话管线的核心区别在于：轨迹 Skill 强制包含工具编排路径和错误恢复机制，合并策略也侧重于鲁棒性增强。
+
+**来源**：`autoskill/offline/trajectory/prompts.py`
+
+### 12.1 轨迹提取 Prompt
+
+```
+You are the Offline Agentic-Trajectory Skill Extractor for the AutoSkill framework.
+Your task is to analyze complex agent interaction trajectories (user messages, 
+tool-use events, environment feedback, and multi-turn reasoning) and extract highly 
+reusable, generalizable workflow skills.
+
+### Evidence & Extraction Rules:
+1. Abstract the Strategy: Focus on the successful orchestration of tools, step-by-step 
+   logic, and problem-solving strategies. Do not just record a sequence of specific events.
+2. Capture Robustness (Crucial): Explicitly extract checkpoints, fallback mechanisms, 
+   and retry logic. How did the agent handle tool errors or missing information?
+3. De-identify & Generalize: Strip out specific payloads, transient IDs, local file 
+   paths, timestamps, and one-run values.
+4. Major-Event Prioritization: Focus on the principal success-driving chain.
+5. Strict Relevance Filter: Exclude branches/events that are incidental or noisy.
+6. Strict Null Condition: If the trajectory is non-reusable, return {"skills": []}.
+7. User-Reuse Filter: If unlikely to be reused, return {"skills": []}.
+
+### Output Schema: {"skills": [...]}
+Fields per skill:
+- name: concise, searchable intent+action+tool/workflow phrase
+- description: 1-2 sentences
+- prompt: MUST include these mandatory Markdown sections:
+    - # Role & Objective
+    - # Tool Usage Guidelines     ← 区别于对话管线
+    - # Step-by-Step Workflow     ← 区别于对话管线
+    - # Error Handling & Fallbacks ← 区别于对话管线
+    - # Output Format & Constraints
+- triggers, tags, examples, confidence
+- optional resources/files
+```
+
+**与对话管线的关键区别**：
+
+| | 对话管线 | 轨迹管线 |
+|---|---|---|
+| 输入 | 用户↔Agent 对话 | 工具调用 + 环境反馈 + 多轮推理 |
+| prompt 必含段 | Role/Workflow/Output | 额外强制 `# Tool Usage Guidelines` + `# Error Handling & Fallbacks` |
+| 合并侧重 | 偏好对齐 | 鲁棒性增强 |
+
+### 12.2 轨迹合并 Prompt
+
+```
+### Fusion Strategy: Trajectory-Derived Robustness
+- Objective: Enhance the tool orchestration graph and resilience of the workflow.
+- Primary Path vs. Edge Case: Keep the primary successful tool sequence from the 
+  existing_skill. Inject the candidate_skill's novel error recovery paths, retry 
+  logic, or edge-case handling into the # Error Handling & Fallbacks section.
+- Payload Generalization: Ensure the merged workflow remains agnostic to specific 
+  variables.
+```
+
+合并目标：保留已有 Skill 的主路径，将候选 Skill 的**新增错误恢复路径和边缘情况处理**注入 `# Error Handling & Fallbacks` 段，不替换主干。
+
+---
+
+## 十三、关键设计洞察
 
 ### 12.1 证据溯源原则
 

@@ -1481,6 +1481,241 @@ class SkillMemory(TextualMemoryMetadata):
 
 ---
 
+### 12.9 MOSCore.add() 同步/异步两条路径
+
+**干什么**：Python 端消息入口 `MOSCore.add()` 有两种处理模式。同步模式在 `add()` 内一步完成切块+LLM精读+写入，延迟高但简单；异步模式只做粗存储，把精读任务提交给调度器后台处理，用户不用等 LLM，技能/偏好/工具轨迹提取全部在后台 4 线程并行执行。
+
+```
+                    同步模式 (sync)              异步模式 (async)
+                    ─────────────              ──────────────────
+add()中做什么?       切块 + LLM精读 + 写入       切块(仅Fast包装) + 写入粗记忆
+调度器做什么?         仅日志                      驱动精读: 记忆/技能/偏好/工具 4并行
+技能提取何时触发?     不触发(SimpleStruct)         在 fine_transfer_simple_mem() 中
+                    或在add()内(MultiModal)       由调度器的 MEM_READ_TASK 触发
+偏好提取何时触发?     add()中直接同步完成           由调度器的 PREF_ADD_TASK 异步触发
+延迟                 高(用户等待LLM)              低(用户只等Fast切块，精读在后台)
+```
+
+**同步模式走线**：
+
+```
+MOSCore.add(messages)
+  │  线程池并发 (max_workers=2)
+  ├─ 线程1: process_textual_memory()
+  │   └─ mem_reader.get_memory(mode="fine")
+  │       ├─ coerce_scene_data()              ← 格式标准化 + 注入时间戳
+  │       ├─ get_scene_data_info()            ← 预切分 (每10条消息一组，重叠2条)
+  │       ├─ _iter_chat_windows()             ← token级滑动窗口切块
+  │       └─ LLM提取结构化记忆 → 直接写入图+向量库
+  └─ 线程2: process_preference_memory()
+      └─ pref_mem.get_memory() → pref_mem.add()   ← 直接同步提取+写入偏好
+```
+
+**异步模式走线**：
+
+```
+MOSCore.add(messages)
+  │  线程池并发 (max_workers=2)
+  ├─ 线程1: process_textual_memory()
+  │   └─ mem_reader.get_memory(mode="fast")   ← 不调LLM，直接包装为MemoryItem
+  │       └─ scheduler.submit(MEM_READ_TASK)  ← 提交调度器精读 ★
+  └─ 线程2: process_preference_memory()
+      └─ scheduler.submit(PREF_ADD_TASK)      ← 提交调度器异步处理
+
+调度器消费 MEM_READ_TASK → fine_transfer_simple_mem()
+  4线程并行:
+  ├─ 线程A: _process_string_fine()            ← LLM提取结构化记忆
+  ├─ 线程B: process_skill_memory_fine()       ← 技能提取 ★
+  ├─ 线程C: process_preference_fine()         ← 偏好提取
+  └─ 线程D: _process_tool_trajectory_fine()   ← 工具轨迹提取
+```
+
+**关键纠正**：
+1. 技能提取**不是调度器的独立任务类型**，而是在 `fine_transfer_simple_mem()` 内部 4 线程并行执行
+2. 切块**发生在 `add()` 阶段**，调度器拿到的已经是切好的 memory IDs
+3. 同步模式下**调度器不参与核心流程**
+
+---
+
+### 12.10 切块实现详解
+
+**干什么**：Python 端有 6 种切块策略，针对不同场景和粒度需求，保证不同大小/类型的内容都能被正确切块而不丢失数据。
+
+| 切块器 | 粒度 | 重叠方式 | 适用场景 |
+|--------|------|---------|---------|
+| `_iter_chat_windows` | token 级 (默认1024) | 弹出头部到 200 tokens | 主力记忆提取 |
+| `get_scene_data_info` | 每10条消息 | 尾部 2 条 | 预切分（粗粒度，在token窗口之前执行） |
+| Strategy `content_length` | 字符数 | 尾部 1 条消息 | 长消息场景 |
+| Strategy `session` | N 条消息 | 步长滑动 | 固定窗口场景 |
+| Splitter `lookback` | QA 对 | 回看 N 轮 | 偏好提取（高重叠，捕捉偏好演变） |
+| Splitter `overlap` | 每10条消息 | 尾部 2 条 | 偏好提取（低重叠，快速切块） |
+| SentenceChunker | 句子边界 | token overlap | 文档类消息 |
+
+**MultiModal 主力切块的三层保底机制**（`_concat_multi_modal_memories`）：
+
+```
+保底1 — 单条超大: 超过 max_tokens 的 item 先用 SentenceChunker 拆小，拆失败原样保留
+保底2 — 窗口不空: buf 为空时即使超了 max_tokens 也先放进去，保证每窗口至少一条
+保底3 — 尾部不丢: 循环结束后 buf 里剩余内容全部输出，不截断
+```
+
+**切块前的预处理（保真度优先，轻量标准化）**：
+
+| 步骤 | 做了什么 |
+|------|---------|
+| 格式标准化 | 补时间戳、拉平多模态 content |
+| 消息格式化 | 拼成 `role: [time]: content\n` |
+| URL 保护 | 替换为占位符防切断，完成后恢复 |
+| 智能断点 | 优先在 `\n\n` / `。` / `. ` 处切分 |
+
+---
+
+### 12.11 偏好提取 (Preference Extraction)
+
+**干什么**：从对话中并行提取两类偏好，分别存储，并通过去重和更新判断防止重复写入。与技能提取一起在异步模式的 4 线程中并行运行。
+
+**核心文件**: `src/memos/mem_reader/read_pref_memory/process_preference_memory.py`
+
+两类偏好**并行提取**：
+
+**显式偏好（NAIVE_EXPLICIT_PREFERENCE_EXTRACT_PROMPT_ZH）**：用户明确表达的态度、选择、拒绝。要求提取偏好的演变过程（原始偏好 + 更新后偏好），同主题多个偏好合并为一条。
+
+```
+输出：[{explicit_preference, context_summary, reasoning, topic}]
+```
+
+**隐式偏好（NAIVE_IMPLICIT_PREFERENCE_EXTRACT_PROMPT_ZH）**：用户未直接表达，通过行为模式、决策逻辑、情境信号推断。限制：只有一轮问答不提取，Assistant 建议未被用户认可不提取。
+
+```
+输出：[{implicit_preference, context_summary, reasoning, topic}]
+```
+
+**去重流程**（两步）：
+
+```
+Step 1 — NAIVE_JUDGE_DUP_WITH_TEXT_MEM_PROMPT_ZH
+  新偏好 vs 已有记忆（向量召回）→ 语义相似即判 exists=true
+
+Step 2 — NAIVE_JUDGE_UPDATE_OR_ADD_PROMPT_ZH（exists=true 时触发）
+  判断新旧偏好是否表达相同核心问题 → is_same=true → 更新，false → 新增
+```
+
+---
+
+### 12.12 工具轨迹提取 (Tool Trajectory)
+
+**干什么**：从工具调用历史中提取 `when...then...` 格式的经验规则，成功路径提炼最佳实践，失败路径分析根因并提炼避坑规则。每条工具调用记录 success_rate，供未来相似场景复用。类比 design-v2 中的 experience + tool_preference，但 MemOS 合并为一个 Prompt 处理。
+
+**核心 Prompt**: `TOOL_TRAJECTORY_PROMPT_ZH`（`templates/tool_mem_prompts.py`）
+
+```
+步骤1：判断任务完成度 → success / failed（用户反馈优先于执行结果）
+
+步骤2（success）：经验提炼
+  采用 when...then... 结构：
+  - when: 触发场景特征（任务类型、工具环境、参数特征）
+  - then: 有效的参数模式、调用策略、最佳实践
+  注意：经验是整个轨迹级别的，不仅针对单个工具
+
+步骤3（failed）：错误分析
+  3.1 任务是否需要工具？（需要/直接回答/误调用）
+  3.2 工具调用检查：存在性、选择正确性、参数正确性、幻觉检测
+  3.3 错误根因定位
+  3.4 经验提炼（when...then... 给出避免错误的通用策略）
+```
+
+输出格式：
+
+```json
+[{
+  "correctness": "success | failed",
+  "trajectory": "任务 -> 执行动作 -> 执行结果 -> 最终回答",
+  "experience": "when...then...格式",
+  "tool_used_status": [{
+    "used_tool": "工具名",
+    "success_rate": "0.0-1.0",
+    "error_type": "失败时的错误类型，成功为空",
+    "tool_experience": "调用该工具的经验，含前置条件和后置效果"
+  }]
+}]
+```
+
+---
+
+### 12.13 反馈修正闭环
+
+**干什么**：处理用户对 Agent 回答的纠正反馈，将用户的纠正自动同步回记忆库。三步串行：先识别是否为关键词替换，再判断反馈有效性，最后决定对已有记忆执行 ADD/UPDATE/NONE 操作。
+
+**核心文件**: `src/memos/mem_feedback/`（`templates/mem_feedback_prompts.py`）
+
+**Step 1 — 关键词替换检测（KEYWORDS_REPLACE_ZH）**
+
+识别用户是否在要求批量替换某个词（如"把文档里的'张三'都改成'李四'"），输出替换范围、原词、目标词。不是关键词替换则走后续判断流程。
+
+```json
+{"if_keyword_replace": "true/false", "doc_scope": "...|NONE", "original": "...", "target": "..."}
+```
+
+**Step 2 — 反馈有效性判断（FEEDBACK_JUDGEMENT_PROMPT_ZH）**
+
+判断反馈是否与对话历史相关，识别用户态度（dissatisfied/satisfied/irrelevant），提取纠正后的核心事实信息（保留时间信息）。
+
+```json
+[{"validity": "true/false", "user_attitude": "dissatisfied|satisfied|irrelevant",
+  "corrected_info": "事实信息", "key": "记忆标题", "tags": "关键词"}]
+```
+
+**Step 3 — 记忆更新操作（UPDATE_FORMER_MEMORIES_ZH）**
+
+将新事实与已有记忆逐一对比，决定操作类型：
+
+| 操作 | 条件 |
+|------|------|
+| `NONE` | 新事实未提供额外信息 |
+| `UPDATE` | 新事实更准确/完整/需修正，仅修改相关错误片段 |
+| `ADD` | 无匹配的已有记忆，作为全新信息写入 |
+
+```json
+{"operations": [{"id": "记忆ID", "text": "最终采用的记忆", "operation": "ADD|UPDATE|NONE", "old_memory": "..."}]}
+```
+
+---
+
+### 12.14 记忆检索增强管线
+
+**干什么**：查询时的记忆召回增强流程。先判断是否需要检索，多路召回后过滤冗余，对保留的记忆做消歧增强（代词→全名、相对时间→具体日期），不足时扩大召回，最终注入 System Prompt。
+
+**检索流程**：
+
+```
+用户查询 → 意图识别 → 关键词提取 → 多路召回
+                                      ├─ 向量检索 (Qdrant)
+                                      ├─ 图检索 (Neo4j subgraph)
+                                      ├─ BM25 全文检索
+                                      └─ 互联网检索 (可选)
+                                           │
+                                           ▼
+                                    记忆过滤 + 去重 + 重排序
+                                           │
+                                           ▼
+                                    记忆增强 (消歧/合并/补全)
+                                           │
+                                           ▼
+                                    注入 System Prompt → LLM 生成回答
+```
+
+**4 个 Prompt**：
+
+**意图识别（INTENT_RECOGNIZING_PROMPT）**：判断当前工作记忆是否足够回答用户问题，输出 `trigger_retrieval=true/false` + 已有证据 + 缺失证据类型。
+
+**记忆增强（MEMORY_RECREATE_ENHANCEMENT_PROMPT）**：将召回的原始记忆转换为完全消歧的陈述。代词→全名，相对时间→具体日期，合并互补细节，过滤与查询无关内容。
+
+**联合过滤（MEMORY_COMBINED_FILTERING_PROMPT）**：两步过滤：① 移除与查询完全无关的记忆；② 冗余去重，保留最简洁且与查询最相关的版本。输出保留记忆的索引列表 + 移除统计。
+
+**扩大召回（ENLARGE_RECALL_PROMPT_ONE_SENTENCE）**：分析现有记忆与用户查询的差距，识别缺失事实，生成一句改写查询用于二次检索。`trigger_recall=false` 时不触发。
+
+---
+
 ## 十三、LLM Prompt 完整清单
 
 ### TS 端
