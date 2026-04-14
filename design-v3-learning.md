@@ -18,7 +18,7 @@
 
 ### 迭代一范围
 
-- 学习与演进合并在同一个模块，在 session_end / compact 时批处理
+- 学习与演进合并在同一个模块，定时从消息缓存区捞取并批处理
 - 不依赖实时 Cursor / 主题漂移检测
 - Dreaming 跨 session 归纳 → 迭代二
 
@@ -27,8 +27,8 @@
 ## 1. 整体架构
 
 ```
-触发：session_end / compact
-输入：N 轮完整对话消息
+触发：定时从消息缓存区捞取（间隔可配）
+输入：缓存区中待处理的对话消息
 
 ─────────────────────────────────────────────────────────────────────
 Step 1  预过滤（零 LLM）
@@ -40,11 +40,41 @@ Step 1  预过滤（零 LLM）
 Step 2  生成滑动窗口（n=10, m=2, step=8）
           ← MemOS Python 端滑动窗口参数
 
-Step 3  逐窗口处理
+Step 3  逐窗口处理（E+TP 提取 + Workflow 分流）
+
+        3a. E+TP 候选池提取（每个窗口都执行，不分路线）
+          大模型 LearnExperience 提取：
+            四条分析路径：成功/失败→恢复/用户纠正/工具选择
+            experience 三类：工具技巧 / 纠错记忆 / 用户反馈
+            tool_preference："做X时优先用Y"
+            ← XSkill INTRA_SAMPLE_CRITIQUE
+          两层查重：
+            第一层：查 skills_library（三路相似度）
+              score ≥ 0.85 → 直接 merge 更新 active 条目
+              score < 0.50 → add，进第二层
+              0.50–0.85 → 小模型决策 merge/add
+            第二层：查候选池（三路相似度，同上阈值）
+              merge → 已有候选 mention_count++ / hard_count++
+              add → 新建候选
+          候选池打分（support_score）：
+            0.50×mention + 0.25×recency + 0.25×hard
+            is_hard=true → 一次即过早期阈值
+            is_hard=false → 需跨 session 积累
+          support_score ≥ 动态阈值 → 升格直接入库 active
+
+        3b. Workflow 分流
           扫描 context_assemble → used_skill_ids
-          ├─ 非空 → §6 升级路线（反馈纠正驱动）
-          │          反馈修正检测（MemOS FEEDBACK_JUDGEMENT_PROMPT）
-          │          EvolveSkill 改写  ← MemOS Upgrader
+          ├─ 非空，含内部 skill → §6 升级路线（反馈纠正驱动）
+          │    for each managed_skill in used_skill_ids:
+          │      逐条 user 消息 → 小模型反馈判断（MemOS FEEDBACK_JUDGEMENT_PROMPT）
+          │        → validity + user_attitude + corrected_info
+          │        → 仅 dissatisfied + corrected_info 非空 → 产出 signal
+          │      signal 为空 → 跳过该 skill
+          │      signal 非空 → 大模型 EvolveSkill 改写 SKILL.md
+          │        → 规则验证 → 通过写入 + 触发 Scripts/References/Evals 更新
+          │                   → 失败恢复备份
+          │
+          ├─ 非空，全是外部 skill → 跳过（不学习、不拼接）
           │
           └─ 空   → 进入主题拼接积累
 
@@ -54,6 +84,7 @@ Step 4  主题拼接 → Chunk flush
           ← 自研（替代 MemOS 实时 Cursor 机制）
 
 Step 5  Chunk 处理
+          小模型提取工作概览（task_summary + search_query）
           混合搜索（向量 + 关键词 + 名称）
           LLM Judge 语义匹配
           ← MemOS SkillEvolver search → judge 路径
@@ -61,20 +92,17 @@ Step 5  Chunk 处理
           ├─ 未命中 → §8.3 创建新 skill
           │            LearnSkill Prompt（提取规则 ← AutoSkill §1-§5）
           │                            （写作原则 ← MemOS STEP1_SKILL_MD_PROMPT）
-          │            并行：Scripts / References  ← MemOS Generator
-          │            规则验证 → active / draft
           │            Dedup（三阶 add/merge/discard）     ← AutoSkill 维护管线
+          │            add → 规则验证 → active + Scripts/References/Evals → 入库
+          │            merge → 合并 → 规则验证 → Scripts/References/Evals 增量更新
           │
-          └─ 命中   → §8.4 内容合并
-                       规则层差异分析（零 LLM）
-                       EnrichSkill 合并               ← AutoSkill Skill Merger
-
-Step 6  E+TP 候选池
-          LearnExperience Prompt
-            分析框架（成功/失败/纠正）  ← XSkill INTRA_SAMPLE_CRITIQUE
-            格式："When X, do Y"        ← XSkill Experience 定义
-          候选池打分 + 动态阈值          ← AutoSkill Requirement Memory
-          Dedup（三阶 add/merge/discard）← AutoSkill 维护管线
+          └─ 命中   → §8.4 内容合并（agent 未使用该 skill，新执行经验驱动）
+                       大模型 EnrichSkill 一次完成 diff + 合并：
+                         已有 SKILL.md + Chunk 用户消息 + 工具调用
+                         → 判断有无新触发场景 / 新做法 / description 缺口
+                         → enrich：合并新内容 → 规则验证 → 写入 + Scripts/References/Evals 更新
+                         → no_change + description 缺口 → 小模型改善 description
+                         → no_change 无缺口 → 跳过
 ─────────────────────────────────────────────────────────────────────
 ```
 
@@ -594,9 +622,31 @@ session 结束 → flush(chunk, forced=False)  ← 保底
 
 ## 8. Step 5 — Chunk 提取新 Workflow（MemOS 路径）
 
-对每个 flush 出的 Chunk，走 search → judge → create/upgrade。
+对每个 flush 出的 Chunk，走 概览提取 → search → judge → create/upgrade。
 
-### 8.1 混合搜索已有 Workflow
+### 8.1 工作概览提取（小模型）
+
+从 Chunk 原始消息中提取结构化工作概览，作为后续搜索和提取的输入：
+
+```
+[System]
+从以下对话片段中提取工作概览。
+
+输出 JSON：
+{
+  "task_summary": "<一句话描述用户要完成的任务>",
+  "tools_used": ["<使用的工具/命令列表>"],
+  "key_steps": ["<关键操作步骤，3-5 条>"],
+  "search_query": "<用于检索已有 workflow 的搜索语句，15-30 字>"
+}
+
+[User]
+{{chunk_messages}}
+```
+
+### 8.2 混合搜索已有 Workflow
+
+用 `search_query` 作为检索输入：
 
 ```
 得分 = 0.70 × 向量余弦相似度
@@ -606,11 +656,11 @@ session 结束 → flush(chunk, forced=False)  ← 保底
 取 top-5，score < 0.35 的过滤掉
 ```
 
-### 8.2 LLM Judge（小模型）
+### 8.3 LLM Judge（小模型）
 
 ```
 输入：
-  chunk_summary ← Chunk 内 user 消息拼接（前 500 字符）
+  task_summary ← §8.1 提取的任务概览
   top-5 skill 的 name + description + context
 
 输出：
@@ -626,7 +676,7 @@ session 结束 → flush(chunk, forced=False)  ← 保底
 
 必须是同一类型的工作流程才算匹配，宽泛或切线相关不算。
 
-当前窗口摘要：{{chunkSummary}}
+任务概览：{{task_summary}}
 
 候选 workflow（序号、name、description）：
 {{skillList}}
@@ -731,9 +781,12 @@ Full Conversation:
 
 ---
 
-#### 8.3.2 并行依赖文件生成（借鉴 MemOS Generator）
+#### 8.3.2 依赖文件生成（借鉴 MemOS Generator）
 
-LearnSkill 完成后，`Promise.all` 并行生成三类附属文件：
+> 注：Scripts / References 在 Dedup 之后才生成（§8.5 判 add 后）。
+> 避免 Dedup 判 merge/discard 时已浪费生成资源。
+
+`Promise.all` 并行生成两类附属文件：
 
 **Scripts**（从对话中提取可复用脚本）：
 ```
@@ -765,27 +818,53 @@ LearnSkill 完成后，`Promise.all` 并行生成三类附属文件：
 [{"filename": "xxx.md", "content": "..."}]
 ```
 
-> Evals 不在学习阶段生成，由演进模块 Step 2 按需生成（description 优化时才需要）。
+**Evals**（生成触发测试集，供演进模块离线使用）：
+```
+基于以下 skill，生成能触发该 skill 的真实测试 prompt。
 
-#### 8.3.3 规则验证后入库
+要求：
+- 生成 3-4 个 should_trigger prompt（真实用户会输入的）
+- 生成 2-3 个 should_not_trigger prompt（近似但不相关的任务）
+- 混合直接和间接表达方式
+- 语言与 skill 内容一致
+
+输出 JSON 数组：
+[{"prompt": "...", "should_trigger": true|false}]
+```
+
+> Evals 在学习阶段生成但不做验证，仅存储供演进模块 Step 2（description 优化）和 Step 3（GEPA）使用。
+
+#### 8.3.3 规则验证
 
 frontmatter / sections / steps / 长度 / 去标识化检查（同 §6.5）。
 
 ```
-规则验证通过 → skill.status = "active"，入库 + 加入检索索引
-规则验证不通过 → skill.status = "draft"，入库但不加入检索索引
-                   （演进模块 Step 2 优先处理 draft skill）
+规则验证通过 → skill.status = "active"
+规则验证不通过 → skill.status = "draft"
 ```
 
 > 不做 Evals 召回率验证。description 质量由演进模块 Step 2 离线优化，
-> 学习模块只保证格式合法即可入库。
+> 学习模块只保证格式合法。
 
-持久化结构：
+#### 8.3.4 完整入库流程
+
+```
+LearnSkill 生成 SKILL.md
+  → Dedup（§8.5 三阶 add/merge/discard）
+      ├─ add → 规则验证（§8.3.3）
+      │         通过 → active + 并行生成 Scripts / References / Evals → 入库
+      │         不通过 → draft → 入库（不生成依赖文件，等演进模块处理）
+      ├─ merge → 合并进已有 skill → 规则验证 → 触发 Scripts / References / Evals 增量更新
+      └─ discard → 丢弃，不做任何操作
+```
+
+持久化结构（add 后）：
 ```
 skills/{skill-name}/
   ├── SKILL.md
   ├── scripts/
-  └── references/
+  ├── references/
+  └── evals/evals.json    ← 供演进模块 Step 2/3 使用
 ```
 
 ### 8.4 内容合并路线（selectedIndex > 0 — agent 未使用已有 skill）
@@ -1071,7 +1150,6 @@ CREATE TABLE memory_candidates (
 
   -- 打分字段
   mention_count   INTEGER DEFAULT 0,  -- 累计出现次数（跨窗口/session）
-  recent_count    INTEGER DEFAULT 0,  -- 近 3 个 session 出现次数
   hard_count      INTEGER DEFAULT 0,  -- 作为 hard 约束出现次数
   total_updates   INTEGER DEFAULT 0,  -- 总更新次数（决定成熟度）
   first_seen_at   INTEGER NOT NULL,
@@ -1086,19 +1164,18 @@ CREATE TABLE memory_candidates (
 
 ```
 mention_ratio = mention_count / total_updates
-recent_ratio  = recent_count / 3
 recency_score = exp(-(now - last_seen_at) / 7days)
 hard_ratio    = hard_count / mention_count
 
 support_score =
-  0.45 × mention_ratio   （跨次出现率，权重最高）
-+ 0.25 × recent_ratio    （近期活跃度）
-+ 0.10 × recency_score   （时间衰减）
-+ 0.20 × hard_ratio      （显式纠正比例）
+  0.50 × mention_ratio   （跨次出现率，权重最高）
++ 0.25 × recency_score   （时间衰减，越近越高）
++ 0.25 × hard_ratio      （显式纠正比例）
 ```
 
 **核心效果**：
-- 用户显式纠正（hard=true）→ hard_ratio=1.0 → score ≥ 0.20 → 第一次即可通过早期阈值
+- 用户显式纠正（hard=true）→ hard_ratio=1.0 + recency_score≈1.0 → score ≈ 0.50 → 第一次即过
+- Agent 推断的 soft 规律 → 需要跨多次积累 mention_ratio → 反复验证后才升格
 - Agent 推断的 soft 规律 → 需要跨多次 session 积累 mention_ratio → 反复验证后才升格
 
 ### 9.4 动态升格阈值
@@ -1145,7 +1222,7 @@ support_score =
   ├─ merge（找到匹配 m）
   │   mention_count++
   │   if c.is_hard: hard_count++
-  │   recent_count 滚动更新（最近 3 session 窗口）
+  │   last_seen_at = now
   │   total_updates++
   │   重新计算 support_score
   │
@@ -1261,7 +1338,7 @@ support_score =
 ## 10. 完整数据流
 
 ```
-session_end / compact
+定时从消息缓存区捞取
   │
   第一层清洗（全量）
     → 移除 system/哨兵/注入/机械回复整轮
@@ -1275,31 +1352,51 @@ session_end / compact
   │
   for Wi in windows:
     │
-    scan(Wi) → used_skill_ids
+    ├─ [3a] E+TP 提取（每个窗口都执行）
+    │    大模型 LearnExperience 提取
+    │    → 第一层：查 library（三路相似度）
+    │      score ≥ 0.85 → merge 更新 active
+    │      score < 0.50 → add 进第二层
+    │      0.50–0.85 → 小模型决策
+    │    → 第二层：查候选池（三路相似度）
+    │      merge → 加分 / add → 新建
+    │    → 候选池打分（0.50×mention + 0.25×recency + 0.25×hard）
+    │    → 达阈值 → 直接入库 active
     │
-    ├─ 非空 → 升级路线（§6）
-    │          反馈修正检测 → signal
-    │          signal 非空 → EvolveSkill → 规则验证 → 写入
-    │          窗口消耗，不进拼接
-    │
-    └─ 空 → 主题拼接（§7）
-             keyword 提取 → Jaccard 比较
-             积累 chunk（上限：3窗口 / 2h → 强制flush）
-             │
-             flush → Chunk
-               │
-               ├─ Workflow 处理（§8）
-               │   混合搜索 → Judge
-               │     ├─ 未命中 → §8.3 创建
-               │     │           LearnSkill → 并行(Scripts/Refs)
-               │     │           → 规则验证 → §8.5 Dedup → 写入
-               │     └─ 命中   → §8.4 内容合并
-               │                 EnrichSkill（大模型，一次完成 diff+合并）
-               │                 → 规则验证 → 写入
-               │
-               └─ E+TP 候选提取（§9）
-                   → 先查 library（merge→更新 / add→进池）
-                   → 候选池打分 → 达阈值 → 直接入库 active
+    ├─ [3b] Workflow 分流
+    │    scan(Wi) → used_skill_ids
+    │    │
+    │    ├─ 非空，含内部 skill → 升级路线（§6）
+    │    │    for each managed_skill:
+    │    │      逐条 user 消息 → 小模型反馈判断
+    │    │        dissatisfied + corrected_info → signal
+    │    │      signal 非空 → 大模型 EvolveSkill → 规则验证 → 写入
+    │    │        + Scripts/Refs/Evals 增量更新
+    │    │    窗口消耗，不进拼接
+    │    │
+    │    ├─ 非空，全是外部 skill → 跳过
+    │    │
+    │    └─ 空 → 主题拼接（§7）
+    │         keyword 提取 → Jaccard > 0.6 直接拼接
+    │                       Jaccard ≤ 0.6 → 小模型判断 same_topic
+    │         积累 chunk（上限：3窗口 / 2h → 强制flush）
+    │         │
+    │         flush → Chunk
+    │           │
+    │           小模型提取工作概览（task_summary + search_query）
+    │           → 混合搜索（向量+关键词+名称）→ Judge
+    │             ├─ 未命中 → §8.3 创建
+    │             │   LearnSkill（大模型）
+    │             │   → Dedup（三阶 add/merge/discard）
+    │             │   → add：规则验证 → active + Scripts/Refs/Evals → 入库
+    │             │   → merge：合并 → 规则验证 → Scripts/Refs/Evals 更新
+    │             │   → discard：丢弃
+    │             │
+    │             └─ 命中 → §8.4 内容合并
+    │                 大模型 EnrichSkill（一次完成 diff+合并）
+    │                 → enrich：规则验证 → 写入 + Scripts/Refs/Evals 更新
+    │                 → no_change + description 缺口 → 小模型改善 description
+    │                 → no_change 无缺口 → 跳过
 ```
 
 ---
@@ -1308,10 +1405,32 @@ session_end / compact
 
 | 事件 | 输入 | 备注 |
 |------|------|------|
-| `session_end` | 完整 session 消息 | 主路径 |
-| `compact` | sessionFile（compact 前全量） | 防止 compact 丢失细节 |
+| 定时捞取 | 消息缓存区中待处理的消息 | 主路径，间隔可配 |
+| `compact` | compact 前全量消息写入缓存区 | 防止 compact 丢失细节 |
 
-agent_end 不触发（单个 agent 任务不足以跑完整 pipeline）。
+**消息缓存区机制**：
+
+```
+agent 执行中：
+  每轮对话消息 → 写入消息缓存区（append-only）
+  标记：session_id + turn_id + timestamp
+
+定时捞取（默认间隔 5 分钟）：
+  从缓存区取出 status=pending 的消息
+  → 标记为 processing
+  → 跑完学习管线后标记为 done
+  → 下次捞取跳过 done 消息
+
+compact 事件：
+  compact 前将完整 sessionFile 写入缓存区
+  → 避免 compact 后细节丢失
+```
+
+注：定时捞取可以在 session 进行中触发，不必等 session 结束。长 session 不会积压到最后一次性处理。
+
+### 11.1 串行处理
+
+学习管线采用串行处理：一批消息跑完再捞下一批，不做并行。后台批处理不需要并发，串行天然避免多批同时修改同一 skill 的问题。
 
 ---
 
