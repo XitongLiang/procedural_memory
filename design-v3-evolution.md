@@ -76,8 +76,11 @@ Step 4  冗余合并（active / stale skill）
 | `eval_queries_per_skill` | 12 | 触发评估集大小（6 should + 6 not） |
 | `runs_per_query` | 3 | 每个 query 测试 3 次取可靠触发率 |
 | `holdout_ratio` | 0.4 | 40% 数据留做测试集（防过拟合） |
-| `max_content_iterations` | 2 | 内容质量演进最多轮次 |
-| `quality_pass_threshold` | 0.70 | LLM-as-judge 质量分 ≥ 70% 视为通过 |
+| `quality_pass_threshold` | 0.70 | LLM-as-judge 质量分 ≥ 70% 跳过 GEPA |
+| `max_gepa_generations` | 3 | GEPA 最多优化代数 |
+| `mutations_per_generation` | 3 | 每代并行生成的变异候选数 |
+| `max_gepa_per_run` | 3 | 每次 Dreaming 最多对几个 skill 跑完整 GEPA（成本控制）|
+| `gepa_min_usage` | 5 | usage_count 低于此值的 skill 跳过 GEPA |
 
 ---
 
@@ -306,116 +309,136 @@ else:
 
 ---
 
-## 5. Step 3 — 内容质量演进（借鉴 Hermes GEPA 思路）
+## 5. Step 3 — 内容质量演进（Hermes GEPA）
 
-针对 active skill，从历史会话中挖掘使用证据，识别失败模式，提出内容改进。
+针对 active skill，构建评估数据集，通过多代变异+实际执行测试选出最优版本。
 
-### 5.1 Session DB 挖掘（零 LLM）
+### 5.1 构建评估数据集
+
+两个来源合并，数据不足（< 5 条）→ 跳过，记录 `CONTENT_SKIP(no_evidence)`：
 
 ```
-查询条件：
-  session_archive WHERE skill_id = {skill.id}
-  AND skill_used = true              ← 实际被执行（不只是被召回）
-  ORDER BY session_id DESC
-  LIMIT 20                           ← 取最近 20 次使用记录
+来源 a：skill 的 evals/evals.json（LearnSkill §8.3.3 时已生成）
+  → 取其中 task_input 字段作为测试任务
 
-对每条 session 记录，提取：
-  - skill 被激活时的 user 消息
-  - skill 执行期间的 tool_uses（命令序列）
-  - 执行是否成功（有无报错 tool_result）
-  - 是否有后续用户纠正（跟在 skill 执行后的 dissatisfied 消息）
+来源 b：session_archive 挖掘（零 LLM）
+  session_archive WHERE skill_id = {skill.id} AND skill_used = true
+  ORDER BY session_id DESC LIMIT 20
+  → 提取 user 消息作为 task_input
+  → 同时保存 tool_uses / 报错记录 / 用户纠正（作为执行轨迹参考）
+
+合并去重后按 6:4 分层拆分：
+  train_tasks（60%）← 优化过程中使用
+  holdout_tasks（40%）← 仅用于最终选版，防过拟合
 ```
 
-数据不足（< 3 条记录）→ 跳过内容演进，记录 `CONTENT_SKIP(no_evidence)`
+### 5.2 基线质量评估（小模型）
 
-### 5.2 LLM-as-judge 质量评估（小模型）
+对当前 SKILL.md 在 train_tasks 上跑 batch_runner，得到基线分：
+
+```
+overall ≥ quality_pass_threshold（0.70）→ 记录 CONTENT_OK，跳过 GEPA
+overall < 0.70 → 进入 §5.3 GEPA 优化循环
+```
+
+LLM-as-judge 评分维度（0-1）：
+```
+1. 遵循流程：agent 是否按 skill 步骤执行？
+2. 输出正确性：任务结果是否正确/有用？
+3. 简洁度：是否在合理步骤数内完成？
+overall = 均值
+```
+
+### 5.3 GEPA 优化循环（最多 `max_gepa_generations` 代）
+
+```python
+current_skill = original_skill
+history = []
+
+for generation in 1..max_gepa_generations:
+
+  # Step 1：生成语义变异候选（大模型，并行）
+  candidates = generate_mutations(
+    skill=current_skill,
+    failure_patterns=failure_patterns,  # 从 batch_runner 轨迹提取
+    n=mutations_per_generation          # 默认 3 个
+  )
+
+  # Step 2：batch_runner 并行测试每个候选（Claude CLI）
+  for candidate in candidates:
+    traces = batch_run(skill=candidate, tasks=train_tasks)
+    candidate.train_score = llm_judge(traces)
+    candidate.failure_patterns = extract_failures(traces)
+
+  # Step 3：选本代最佳，用 holdout 验证
+  best = max(candidates, key=lambda c: c.train_score)
+  holdout_traces = batch_run(skill=best, tasks=holdout_tasks)
+  best.test_score = llm_judge(holdout_traces)
+
+  history.append(best)
+  if best.train_score >= 0.90: break   # 提前收敛
+  current_skill = best                 # 下一代从最佳出发
+
+# 按 holdout test_score 选最终版本（不按 train，防过拟合）
+final = max(history, key=lambda h: h.test_score)
+```
+
+**变异生成 Prompt**（大模型）：
 
 ```
 [System]
-你是一个 workflow skill 质量评估专家。
-评估以下 skill 在真实使用记录中的质量表现。
+你是一个 workflow skill 演进专家。
+基于执行轨迹中的失败模式，生成 {n} 个语义变异版本的 SKILL.md。
 
-评估维度（0-1 分）：
-1. 步骤覆盖率：skill 步骤是否覆盖了用户实际执行的操作？
-2. 步骤准确性：步骤描述与实际执行是否一致？
-3. 异常处理：skill 是否覆盖了出现的报错和边缘情况？
-4. 用户满意度：使用后用户是否有纠正/抱怨？
+变异原则：
+- 每个候选从不同角度修复失败模式（不是随机改写）
+- 从失败模式泛化，不过拟合到特定用例
+- 保持 skill 精简，删除不起作用的部分
+- 解释 WHY，不堆 MUST/ALWAYS/NEVER
+- 重复出现的辅助步骤 → 提取为 scripts/
 
-同时提取失败模式：
-- missing_steps：实际发生但 skill 未覆盖的步骤
-- wrong_steps：skill 步骤与实际操作不符
-- missing_notes：未覆盖的报错/坑
+修复方向示例（每个候选选其中一到两个方向）：
+- missing_steps → 补充步骤（判断是否足够通用）
+- wrong_steps → 精确修正（不改动无关部分）
+- missing_notes → 添加注意事项（❌ 错误做法 → 原因 → ✅ 正确做法）
+- 结构优化 → 合并冗余步骤，提升清晰度
 
-只输出 JSON：
-{
-  "scores": {
-    "step_coverage": 0.0-1.0,
-    "step_accuracy": 0.0-1.0,
-    "error_handling": 0.0-1.0,
-    "user_satisfaction": 0.0-1.0
+只输出 JSON 数组：
+[
+  {
+    "candidate_id": 1,
+    "approach": "修复方向说明",
+    "content": "完整新 SKILL.md",
+    "changes": ["修改了什么及原因"]
   },
-  "overall": 0.0-1.0,
-  "failure_patterns": {
-    "missing_steps": [...],
-    "wrong_steps": [...],
-    "missing_notes": [...]
-  }
-}
-
-[User]
-SKILL.md：
-{skill_content}
-
-使用记录（最近 {N} 次）：
-{session_evidence}
-```
-
-`overall ≥ quality_pass_threshold（0.70）` → 记录 `CONTENT_OK`，跳过改写
-
-`overall < 0.70` → 进入 §5.3
-
-### 5.3 内容演进（大模型，最多 2 轮）
-
-借鉴 Hermes GEPA 的轨迹驱动改写：读完整执行轨迹，诊断**为什么**失败，提出针对性修复。
-
-```
-[System]
-你是一个 workflow skill 内容演进专家。
-根据真实使用轨迹中发现的失败模式，改进 SKILL.md 内容。
-
-改进原则（借鉴 Skill-Creator）：
-1. 从失败模式泛化，不过拟合到特定用例
-2. 保持 skill 精简，删除不起作用的部分
-3. 解释 WHY，不堆 MUST/ALWAYS/NEVER
-4. 重复出现的辅助步骤 → 提取为 scripts/
-
-改写内容：
-- missing_steps → 补充到 ## 执行步骤（判断是否足够通用）
-- wrong_steps → 修正对应步骤（精确替换，不改动无关部分）
-- missing_notes → 补充到 ## 注意事项（❌ 错误做法 → 原因 → ✅ 正确做法）
-
-版本注释：<!-- v{N}: evolve(content) session:{SESSION_RANGE} -->
-
-只输出 JSON：
-{
-  "action": "rewrite|no_change",
-  "content": "完整新 SKILL.md",
-  "changes": ["修改了什么及原因"],
-  "skipped": ["忽略了什么及原因"]
-}
+  ...
+]
 
 [User]
 当前 SKILL.md（v{VERSION}）：
 {skill_content}
 
-质量评估结果：
-{quality_assessment}
-
-失败模式：
+执行轨迹失败模式：
 {failure_patterns}
 ```
 
-规则验证（同 §6.3）→ 备份写入或恢复 → 记录 `CONTENT_EVOLVED`
+### 5.4 约束验证 + 写入
+
+```
+final.test_score > baseline.test_score？
+  否 → 记录 CONTENT_NO_IMPROVEMENT
+
+  是 → 约束验证：
+        ① Skill 大小 ≤ 原来 +20%
+        ② 规则验证（frontmatter / steps / 去标识化）
+        ③ holdout 全量任务通过率 ≥ 基线
+
+        通过 → 备份原版本（→ inactive）→ 写入 final
+               触发增量 scripts / references 更新（同 §8.3.2）
+               版本注释：<!-- v{N}: gepa(content) gen:{G} session:{RANGE} -->
+               记录 CONTENT_EVOLVED
+        失败 → 恢复备份，记录 CONTENT_VALIDATION_FAILED
+```
 
 ---
 
