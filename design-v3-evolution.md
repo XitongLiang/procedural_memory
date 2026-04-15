@@ -222,18 +222,31 @@ Skill context: {context}
 
 ### 4.2 触发率测试（零 LLM，并行）
 
-对每个 query 模拟 agent 收到时的判断，使用 Claude CLI 测试触发率：
+直接通过 openclaw 的 `memory_search` MCP 接口测试召回，不启动 Claude CLI：
 
 ```
-run_single_query(query, skill_name, skill_description):
-  → 创建临时 command 文件（含 description 和 name）
-  → 执行：claude -p "{query}" --output-format stream-json
-  → 解析输出：是否调用了该 skill？
-  → 重复 runs_per_query=3 次
-  → trigger_rate = 触发次数 / 3
-  → pass = trigger_rate ≥ 0.5（should_trigger）
-           OR trigger_rate < 0.5（should_not_trigger）
+run_single_query(query, target_skill_id, top_k=5):
+  → MCP 调用：memory_search(query=query, topK=top_k)
+  → 解析 results[]，查找 target_skill_id
+  → triggered = (skill 在 results 中 且 score ≥ recallMinScore)
+  → 返回 {triggered, score, rank}
+
+  注：召回是确定性的（同 embedding + 同 query → 同结果），
+  无需重复多次，每个 query 跑一次即可。
+
+run_eval(skill_id, evals):
+  for e in evals:
+    r = run_single_query(e.prompt, skill_id)
+    passed = r.triggered     if e.should_trigger
+             NOT r.triggered if NOT e.should_trigger
+  score = passed_count / total
+  返回 {score, details[]}    ← details 含每条 query 的 score/rank，供优化循环使用
 ```
+
+> **为什么不用 `claude -p` 测？**
+> openclaw 架构中 skill 触发分两层：L1 召回层（memory_search 向量+关键词打分，确定性）
+> 和 L2 使用层（agent 收到注入后是否遵循，非确定性）。
+> description 优化（§4.3）改善的是 L1 召回，直接测 memory_search 更准确且快得多。
 
 数据集拆分（防过拟合，借鉴 Skill-Creator）：
 ```
