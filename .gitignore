@@ -1,1 +1,8 @@
-Usersa_netrc
+# Ignore everything
+*
+
+# Except markdown files
+!*.md
+
+# And this file itself
+!.gitignore
