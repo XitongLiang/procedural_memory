@@ -5,6 +5,41 @@
 
 ---
 
+## 总览大表（一页看懂）
+
+> 18 个关键维度 × 7 个系统的横向摘要。详细分析见后续各章。
+
+| # | 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **Skill-Creator** | **XSkill** |
+|---|------|----------|----------|--------------|---------------|------------|-------------------|------------|
+| 1 | **设计哲学** | Facts | Experience | Knowledge Assets | Skills | Evolution Capital | Quality-Tested Skills | Dual-Stream |
+| 2 | **一句话定位** | 历史录像机 | 经验建议书 | 企业技能包 | 方法论抽取器 | 自进化学习者 | 精品课程雕刻 | 行动笔记+任务SOP |
+| 3 | **产物形态** | 文本快照 | `when_to_use`+经验 | SKILL+脚本+评估 | SKILL.md(YAML) | SKILL+脚本 | SKILL+子代理+评估 | Experience(≤64词)+Skill |
+| 4 | **架构耦合度** | 完全解耦 | 松耦合 | 紧耦合 | 紧耦合 | 完全内置 | 紧耦合(Claude) | 独立框架 |
+| 5 | **提取触发** | 显式API | `agent_end` | `agent_end`+话题切换 | 滑窗+`agent_end` | **LLM自主** | **用户主动** | batch后 |
+| 6 | **触发决策者** | 调用方 | 代码硬编码 | 代码硬编码 | 代码硬编码 | LLM 自己 | 用户 | 代码硬编码 |
+| 7 | **Prompt 数量** | 1 | 4 | 6-8 | 3-4 | 0(系统提示) | 0(人机迭代) | **10** |
+| 8 | **失败轨迹学习** | ✗ | **✓**(独有) | ✗ | ✗ | 隐式 | **✓**(基线对比) | **✓**(跨rollout) |
+| 9 | **多路径对比** | ✗ | ✗ | ✗ | ✗ | ✗ | **构造A/B** | **自然N=4** |
+| 10 | **去重机制** | 无 | 向量余弦 | hash+语义LLM | 向量+4维LLM | 无 | 人工 | 嵌入≥0.7+LLM |
+| 11 | **质量门控** | ✗ | 5维验证 | 0-10评分 | 4维身份 | ✗ | 4子代理+人工 | 跨轨迹+64词 |
+| 12 | **使用审计闭环** | ✗ | utility/freq | ✗ | **✓**(retrieved→used) | ✗ | eval pass_rate | ✗ |
+| 13 | **通用化程度** | 无 | 中 | 高 | 高 | 高 | **最高** | 高 |
+| 14 | **复用测试** | ✗ | ✗ | evals/ | SkillEvo replay | GEPA测试套件 | **`claude -p`黑盒** | 5bench×4backbone |
+| 15 | **更新默认操作** | ADD | Rewrite合并 | add/merge/upgrade | add/merge/discard | LLM create/patch | 人工迭代 | add/modify+合并 |
+| 16 | **主存储** | 向量DB(20+) | 向量DB | SQLite+文件 | 文件+向量 | 文件系统 | 文件系统 | 文件+numpy |
+| 17 | **检索方式** | 语义向量 | 向量+LLM重排 | FTS+向量混合 | 向量+BM25(0.9:0.1) | 系统提示动态加载 | `claude -p`端到端 | 任务分解+top-k=3 |
+| 18 | **离线演进** | ✗ | 仅老化删除 | SkillEvo(遗传) | SkillEvo(遗传) | **GEPA**(最完整) | 描述优化(train/test) | 层次化精炼 |
+| 19 | **LLM 调用开销** | 1次 | 3-4次 | 5-9次 | 5-8次/轮 | 1次 | 2-3M tokens/技能 | N+3+K/样本 |
+| 20 | **最佳场景** | 断点恢复 | 长对话Agent | 企业技能管理 | 检索+审计闭环 | 极简自进化 | 少量关键技能 | 多模态视觉推理 |
+
+**阅读这张表的三条捷径**：
+
+- **按产物看光谱**：Mem0 快照 → ReMe 建议 → MemOS/AutoSkill/Hermes 可执行 SOP → Skill-Creator 测试验证 SOP → XSkill 双流分离。产物越往右越"通用+抽象"，越往左越"保真+具体"。
+- **按对比能力看代差**：**第 9 行是最大分水岭**——前 5 个系统都是"单路径提取"，只有 Skill-Creator（刻意构造 A/B）和 XSkill（自然 N=4 rollout）做真正的多路径对比。v5 §7.1a 的会话内检测是这条轴上的第三个选项。
+- **按成本/质量看定位**：Hermes（1 次调用）和 Skill-Creator（2-3M tokens）是两个极端；中间档位按 Mem0 < ReMe < AutoSkill ≈ MemOS < XSkill 递增。开销越高通常换来越强的质量门控和通用化。
+
+---
+
 ## 一、核心定位对比
 
 | 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **Skill-Creator** | **XSkill** |
