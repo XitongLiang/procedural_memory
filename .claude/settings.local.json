@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(awk '-F|' ' *)",
+      "Bash(cp /tmp/comparison-fixed.md /home/x/桌面/procedural_mem/Procedural-Memory-System-Comparison.md)",
+      "Bash(awk ' *)"
+    ]
+  }
+}
