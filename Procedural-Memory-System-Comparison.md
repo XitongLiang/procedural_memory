@@ -859,7 +859,265 @@ pskoett SI  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        O
 
 ---
 
-## 十八、选型建议
+## 十八、更新/学习触发时机详解
+
+> §三 给了触发方式的快速标签（显式 API / `agent_end` hook / LLM 自主 / 用户主动等），§九 给了更新策略（ADD/MERGE/UPDATE/DELETE 的默认操作）。这一节把**触发源**、**决策者**、**判断条件**三个正交维度摊开，系统回答"什么时候更新"这个问题。
+
+### 18.1 触发信号的 6 大类
+
+把所有系统的触发源归纳为 6 类信号：
+
+| 信号类型 | 特征 | 代表系统 |
+|---------|------|---------|
+| **事件型（Event）** | 任务/会话结束、话题切换等离散事件 | Mem0(API) / ReMe(`agent_end`) / MemOS(`agent_end` + 话题切换) / AutoSkill(滑窗 + `agent_end`) / memory-tencentdb(`agent_end`) |
+| **阈值型（Threshold）** | 调用数 / token 数 / recurrence 达标 | Hermes(5+ tool calls) / pskoett(Recurrence≥3 + 跨 2 任务 + 30 天) / OpenViking(`auto_commit_threshold=8000`) |
+| **LLM 自主（LLM-driven）** | LLM 自己判断"这次值得记" | Hermes(`skill_manage` 工具) / OpenSpace(LLM 二次确认门) |
+| **周期扫描（Periodic）** | 后台定时器扫描 | OpenSpace(METRIC_MONITOR 周期) / AutoSkill(SkillEvo 离线 replay) / XSkill(每 8 样本 batch) / OpenViking(MemoryArchiver) |
+| **指标异常（Metric）** | 4 比率 / fallback_rate / 工具降级等客观指标越线 | OpenSpace(TOOL_DEGRADATION + fallback_rate) / AutoSkill(retrieved≥40 & used==0) |
+| **手动（Manual）** | 用户主动触发 / Agent 自觉 | Skill-Creator(用户说"做个技能") / pskoett(Agent 自觉 + `activator.sh` 提醒) / OpenViking(`session.commit()`) |
+
+### 18.2 每个系统的触发全景
+
+| 系统 | 首次学习触发 | 更新触发 | 淘汰/合并触发 |
+|------|-------------|---------|-------------|
+| **Mem0** | 调用方 `add()` | ❌ 不支持 UPDATE | ❌ 无 |
+| **ReMe** | `agent_end` hook + score ≥ threshold | 向量余弦命中 → RewriteMemory 重写 | utility/freq 双维度老化（定时）|
+| **MemOS TS** | `agent_end` + chunk/轮数达标 | Task-finalize 回调 → 7 维 LLM 评估 | dedupStatus 标记（不自动删）|
+| **AutoSkill** | 滑窗 `messages[-6:]` + `agent_end` | 4 维身份匹配 → merge 决策 | **使用审计**：retrieved ≥ 40 & used == 0 → delete |
+| **Hermes** | **LLM 自主**（5+ calls / 修复错误 / 发现 workflow）| LLM 判断 outdated → patch | 容量压力 → LLM 合并 |
+| **OpenSpace** | **3 独立触发器**：<br>① ANALYSIS（每任务完成）<br>② TOOL_DEGRADATION（工具降级事件）<br>③ METRIC_MONITOR（周期扫 4 比率） | fallback_rate 越线 / 工具降级 → FIX 覆写<br>`min_selections ≥ 5` 数据门 + LLM 确认门 | ❌ 无硬删（DAG 保留历史，靠检索排序淘汰）|
+| **Skill-Creator** | 用户说"做个技能"/"优化这个技能" | 用户 A/B feedback → 人工改进 | 人工控制 |
+| **OpenViking** | `session.commit()` 手动 或 `auto_commit_threshold=8000` | MERGE（向量命中 + LLM 四分类）| MemoryArchiver：age > 7d + hotness_score < 0.1 → `_archive/` |
+| **pskoett SI** | `activator.sh` 每轮提醒 / `error-detector.sh` grep 命中 | Recurrence-Count++（Pattern-Key 人工分配）| `wont_fix` 状态标记（不删）|
+| **XSkill** | N 次 rollout 全完成 → batch pipeline | 嵌入余弦 ≥ 0.70 → LLM 合并 / modify 引用 ID | 全局 REFINE delete 低价值 / 容量 > 120 强制合并最相似对 |
+| **memory-tencentdb** | `agent_end` hook → L0→L1→L2→L3 管线 | LLM 四动作（store/skip/update/merge）| L0/L1 `retentionDays` 规则清理；SKIP 直接硬丢（无审计）|
+
+### 18.3 触发决策者：三种模式
+
+```
+代码硬编码（规则触发）          LLM 自主决策              人工决策
+─────────────────────────────────────────────────────────────────────
+Mem0 / ReMe / MemOS TS         Hermes (skill_manage)    Skill-Creator
+AutoSkill / OpenViking         OpenSpace                pskoett (Agent 自判)
+XSkill / memory-tencentdb      (规则 + LLM 二次确认)
+```
+
+- **代码硬编码**：稳定可预测，但需要精心调阈值；OpenSpace 的 `_FALLBACK_THRESHOLD=0.4`、AutoSkill 的 `retrieved ≥ 40`、XSkill 的 `余弦 ≥ 0.70` 都是典型硬编码阈值
+- **LLM 自主**：灵活但依赖模型能力，弱模型可能漏记或乱记；Hermes 完全依赖 LLM 判断"值得记"
+- **人工决策**：最可靠但不可规模化；Skill-Creator 把人放在循环里，pskoett 让 agent 自己判断升格
+
+### 18.4 怎么判断"什么时候更新"——UPDATE 的具体判据
+
+对于支持 UPDATE 的系统，"该不该更新"的具体决策信号：
+
+| 系统 | UPDATE 触发条件 | 合并/覆盖判据 | 防误报设计 |
+|------|---------------|-------------|----------|
+| **ReMe** | 向量余弦 ≥ 阈值 0.5 | LLM RewriteMemory 重写合并 | 无（纯向量距离）|
+| **MemOS TS** | hash 相同 / LLM 语义判断相似 | **7 维评估**（Faster / Elegant / Convenient / Fewer tokens / Accurate / Robust / New scenario / Fixes outdated）| 任务 finalize 回调才触发，不周期扫 |
+| **AutoSkill** | **4 维能力身份匹配**（core job / output contract / constraints / context）| LLM 决策 add/merge/discard | 仅成功轨迹（`successOnly=true`），使用审计 |
+| **Hermes** | LLM 判断 outdated（无硬阈值）| LLM 自主 edit patch | 约束门：新版 ≥ 旧版 |
+| **OpenSpace** | `fallback_rate > 阈值` + `min_selections ≥ 5` | patch-first 生成 diff + apply-retry 3 次（回喂磁盘真实内容）防幻觉 | **三门结构**：数据门（min_selections）+ LLM 确认门 + `_addressed_degradations` 状态门（防反复演进）|
+| **OpenViking** | 向量 top-5 预过滤 + LLM 四分类 | 类别硬规则：PROFILE 总是 MERGE；CASES/EVENTS 不可 MERGE | 类别白/黑名单 |
+| **XSkill** | 嵌入余弦 ≥ 0.70（粗筛）| LLM 合并（MERGE_PROMPT：包含所有信息点，≤ 64 词）| 跨 rollout 批判 + 全局 REFINE 去噪 |
+| **memory-tencentdb** | LLM 四动作判断（store/skip/update/merge）| 向量优先 + FTS fallback 找相似；update 直接替换 | ❌ SKIP 硬丢无审计 |
+
+**关键观察**：
+
+- **纯 LLM 判据**（Hermes）最灵活但最不稳定；**纯规则判据**（ReMe 向量阈值 / XSkill 0.70 / AutoSkill 4 维身份）最稳定但容易漏判细粒度差异
+- **OpenSpace 的三门结构**（数据门 + LLM 确认门 + 状态门）是防误报-防反复演进-防漂移的最完备设计
+- **XSkill 的"嵌入粗筛 + LLM 精合并"**是"成本-质量"平衡的最佳实践——嵌入先把明显无关的挡掉（零 LLM），相似的再交给 LLM 精判
+- **最弱的**是 Mem0（不更新）和 memory-tencentdb SKIP（硬丢无审计）——前者避开了问题，后者忽略了问题
+
+### 18.5 触发设计的三个陷阱
+
+1. **误报陷阱**：指标波动就触发演进 → 演进反而把好 skill 改坏。OpenSpace 用 `min_selections ≥ 5` 数据门 + LLM 确认门双保险
+2. **反复演进陷阱**：同一问题反复触发，每次 patch 后又因指标轻微波动再 patch。OpenSpace 用 `_addressed_degradations` 状态集记录已处理的问题
+3. **触发-淘汰不对称**：有 ADD 触发但无 DELETE 触发 → 记忆库线性膨胀。XSkill 用容量硬限 120 + 强制合并解决；memory-tencentdb 只靠 `retentionDays` 规则清理
+
+---
+
+## 十九、抽取内容的类别光谱
+
+> §二 讲了产物形态（文本快照 / SKILL.md / 双流 / 分层等载体），但**产物里装的语义内容是什么类别**没有横向对比。这一节补齐"抽取到的是**什么类型**的知识"。
+
+### 19.1 内容类别分类法（6 类）
+
+按**内容语义**把各系统抽取的记忆归为 6 类：
+
+| 类别 | 定义 | 典型内容 | 时间性 |
+|------|------|---------|-------|
+| **FACT**（事实）| 用户/环境的相对不变事实 | 用户邮箱、项目常量、API 端点 | 长期稳定 |
+| **EVENT**（事件）| 发生过的具体交互历史 | 对话片段、工具调用记录、时间戳 | 一次性 |
+| **EXPERIENCE**（经验）| 对过去行为的反思 / 教训 | "这样做会失败"、"下次换个工具" | 半稳定 |
+| **SKILL / SOP**（技能）| 可执行的工作流程指令 | "抓取分页：1. 先... 2. 再..." | 可迭代 |
+| **PROFILE / PERSONA**（画像）| 用户身份、偏好、协议 | "用户是数据科学家"、"喜欢简洁回答" | 长期演化 |
+| **TOOL / ENV**（工具/环境）| 工具签名、环境配置、资源链接 | MCP server URL、工具质量指标 | 动态 |
+
+### 19.2 十一个系统的内容覆盖矩阵
+
+| 系统 | FACT | EVENT | EXPERIENCE | SKILL | PROFILE | TOOL | 单/多类别 |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Mem0** | ✅ | ✅（verbatim）| ⚠️（隐式）| ❌ | ⚠️ | ⚠️ | **单一**（事实快照）|
+| **ReMe** | ❌ | ❌ | ✅（含失败）| ⚠️（建议性）| ❌ | ❌ | **单一**（经验）|
+| **MemOS TS** | ❌ | ❌ | ❌ | ✅（完整 SOP + 脚本）| ❌ | ⚠️ | **单一**（技能）|
+| **AutoSkill** | ❌ | ❌ | ❌ | ✅（方法论抽象）| ❌ | ❌ | **单一**（技能）|
+| **Hermes** | ❌ | ❌ | ⚠️（隐式）| ✅ | ❌ | ❌ | **单一**（技能）|
+| **OpenSpace** | ❌ | ❌ | ✅（tool_issues）| ✅ | ❌ | ✅（tool 质量指标）| **多类别**（skill + tool 跨层）|
+| **Skill-Creator** | ❌ | ❌ | ❌ | ✅（精品测试过）| ❌ | ❌ | **单一**（技能）|
+| **OpenViking** | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ | **多类别 8 桶**（User/Agent 双侧分桶）|
+| **pskoett SI** | ❌ | ❌ | ✅（LEARNINGS/ERRORS）| ✅（升格后）| ❌ | ❌ | **多类别 2 层**（Learning + Skill）|
+| **XSkill** | ❌ | ❌ | ✅（Experience）| ✅（Skill）| ❌ | ❌ | **双流**（Experience + Skill）|
+| **memory-tencentdb** | ✅ | ✅（episodic）| ⚠️ | ✅（instruction）| ✅（persona）| ❌ | **多类别 4 层**（L0/L1/L2/L3，L1 含 persona / episodic / instruction 三子类）|
+
+### 19.3 按内容类别看光谱
+
+```
+单一 FACT    单一 EXPERIENCE   单一 SKILL                    多类别融合
+──────────────────────────────────────────────────────────────────────────────
+Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
+(verbatim)   (经验建议)         Skill-Creator                memory-tencentdb (L0-L3)
+                                                             XSkill (Experience + Skill)
+                                                             pskoett (Learning + Skill)
+                                                             OpenSpace (Skill + Tool)
+```
+
+**关键观察**：
+
+- **多类别系统天然需要"分类器"**——OpenViking 用 VLM 单标签八分类，memory-tencentdb 用 LLM 分 persona/episodic/instruction 三档。分类器的准确度直接决定系统质量
+- **单一类别系统实现最简单但覆盖窄**——Mem0 只存 fact，ReMe 只存 experience，无法捕获"复合型"知识需求
+- **XSkill 的双流（Experience + Skill）是粒度分层的典范**——Action 级 64 词 Experience 负责"遇到 X 就做 Y"，Task 级完整 Skill 负责"整个任务的 SOP"
+- **memory-tencentdb 的 `instruction` 是"扁平化的 SKILL"**——所有程序性知识塞进一个类型，缺少动作级/工具级/任务级三粒度分层（详见总览大表第 20 行对此的批评）
+
+### 19.4 抽取粒度（时间尺度）
+
+内容类别之外，还有一个正交维度是**时间粒度**：
+
+| 粒度 | 时间尺度 | 典型内容 | 代表 |
+|------|---------|---------|------|
+| **Action 级**（单步）| 一次工具调用或单个决策 | "用 `rg` 而不是 `grep` 搜代码" | XSkill Experience / pskoett LEARNINGS |
+| **Task 级**（单任务）| 一次完整任务的工作流 | "调 FastAPI 的完整流程" | MemOS / AutoSkill / Hermes / OpenSpace / Skill-Creator / XSkill Skill |
+| **Session 级**（会话）| 一段长对话的摘要 | "本次会话主要在调试认证中间件" | Mem0 / OpenViking / memory-tencentdb L2 |
+| **User 级**（跨会话）| 用户长期画像 | "用户偏好简洁回答" | memory-tencentdb L3 persona |
+
+**多粒度并存是高阶设计**——XSkill（Action + Task）和 memory-tencentdb（Session + User 加 Task 级 instruction）支持；多数系统局限在单一粒度。
+
+### 19.5 内容类别与注入方式的关系
+
+| 类别 | 注入时机 | 典型注入方式 |
+|------|---------|-------------|
+| FACT | 早（常驻）| System Prompt 前置 |
+| PROFILE | 早（常驻）| System Prompt 前置（memory-tencentdb `<user-persona>`）|
+| EXPERIENCE | 按需（相关时）| LLM 适配召回 |
+| SKILL | 按需（触发时）| Tool 响应 / hook 追加 |
+| EVENT | 按需（查询时）| Agent 主动 search |
+| TOOL | 持续（监控）| 跨层反馈（OpenSpace 独有）|
+
+内容类别决定了注入策略——**FACT/PROFILE 适合前置常驻**，**EXPERIENCE/SKILL 适合按需召回**，**TOOL 需要跨层监控**。
+
+---
+
+## 二十、技术路线分类（离线学 / 边干边学）
+
+> 按**知识何时被提炼**这一维度，把各系统归为 4 条技术路线。这决定了系统的**实时性**、**成本结构**和**工程复杂度**。
+
+### 20.1 四条技术路线
+
+| 路线 | 特征 | 时延 | 成本结构 | 代表 |
+|------|------|------|---------|------|
+| **1. 离线批学（Offline Batch）** | 批量数据 → 定期 pipeline 提炼 | 分钟~小时 | 集中但可摊薄 | XSkill (batch=8) / AutoSkill SkillEvo / Hermes GEPA |
+| **2. 在线异步（Online Async）** | 事件触发 → 后台 pipeline 提炼（不阻塞 agent）| 秒~分钟 | 分散但稳定（独立 pipeline）| Mem0 / ReMe / MemOS TS / AutoSkill Sidecar / OpenSpace / OpenViking / memory-tencentdb |
+| **3. 在线同步（Online Sync / 边干边学）** | Agent 思考环内自觉记忆 | 毫秒内（摊入当前推理）| 摊入 agent 自身 token | Hermes (`skill_manage` 工具) / pskoett SI（Agent 自觉 append）|
+| **4. 人机协作（Human-in-the-loop）** | 人主导 + LLM 辅助迭代 | 分钟~小时 | 人工 + LLM 双重成本 | Skill-Creator |
+
+### 20.2 各系统的技术路线归属
+
+| 系统 | 主要路线 | 说明 |
+|------|---------|------|
+| **Mem0** | 在线异步 | `add()` API 异步写入向量库 |
+| **ReMe** | 在线异步 | `agent_end` hook 后台 pipeline |
+| **MemOS TS** | 在线异步 + 离线 upgrade | 在线抽取 + Task-finalize 的离线升级路径 |
+| **AutoSkill** | **在线异步 + 离线批（双轨）**| Sidecar 在线抽取 + SkillEvo 离线 replay |
+| **Hermes** | **在线同步 + 离线批**| `skill_manage` 同步写 + GEPA 离线进化 |
+| **OpenSpace** | 在线异步（3 触发器并行）| ANALYSIS（任务完成）/ TOOL_DEGRADATION（事件）/ METRIC_MONITOR（周期）全异步 |
+| **Skill-Creator** | **人机协作** | 用户主导，子代理 + `claude -p` 辅助测试 |
+| **OpenViking** | 在线异步 | Phase 1 同步归档 + Phase 2 异步抽取（fire-and-forget）|
+| **pskoett SI** | **在线同步（边干边学）** | 成本摊入 agent 自身推理（每轮 +500-2k tokens）|
+| **XSkill** | **离线批学** | 每 batch=8 样本后触发 pipeline，不在线 |
+| **memory-tencentdb** | 在线异步 | `agent_end` hook + 后台 L1→L2→L3 管线（serial queue + checkpoint）|
+
+### 20.3 四条路线的工程特征对比
+
+| 维度 | 离线批学 | 在线异步 | 在线同步（边干边学）| 人机协作 |
+|------|---------|---------|---------------------|---------|
+| **对 agent 侵入性** | 零 | 零（外部 hook）| **高**（侵入思考环）| 中（人参与）|
+| **agent 能力要求** | 低 | 低 | **高**（agent 需理解记忆 spec）| 中 |
+| **实时性** | 最低（批次间隙）| 中（秒级）| **最高**（即时写入）| 最低（人工节奏）|
+| **Token 成本结构** | 集中摊薄（batch 内复用）| 独立 pipeline（隔离）| 摊入 agent（隐性累积）| 人工 + LLM 双重 |
+| **可观测性** | 高（batch 日志清晰）| 高（独立 pipeline）| **低**（嵌 agent 内部）| 最高（人审）|
+| **可移植性** | 好 | 最好 | 差（强依赖 agent 能力）| 差（流程依赖人）|
+| **基础设施需求** | batch runner + 存储 | hook + pipeline + 存储 | **几乎零**（agent 自带）| UI + 评审工具 |
+| **典型场景** | 研究 / benchmark / 少量高质量 skill | 生产 / 多租户 / 企业级 | 个人开发 / 极简部署 | 精品少量 skill |
+| **代表系统** | XSkill / Hermes GEPA | Mem0 / OpenSpace / memory-tencentdb | Hermes (skill_manage) / pskoett | Skill-Creator |
+
+### 20.4 离线 vs 在线的选型权衡
+
+**什么时候选离线批学**：
+- 有 ground_truth 可做 A/B 对照（XSkill 的 N=4 rollout）
+- 场景天然有"回放空间"（AutoSkill SkillEvo 用历史 user 消息当考题 replay）
+- 追求最高质量门控（Hermes GEPA 约束门：新版 ≥ 旧版才晋升）
+- **代价**：记忆"滞后"——新场景要等下一轮 batch 才能学到
+
+**什么时候选在线异步**：
+- 生产环境，要求记忆**下次任务立即可用**
+- 宿主 Hook 机制成熟（OpenClaw / AgentScope / MCP）
+- 宿主 agent 能力不强（不依赖 agent 自觉——Mem0 / MemOS / memory-tencentdb 全走这条）
+- **代价**：需要维护独立 pipeline 基础设施
+
+**什么时候选在线同步（边干边学）**：
+- 个人开发场景，不想维护独立服务（pskoett 的 skill-as-system 极简部署）
+- Agent 模型能力很强（能读懂元 spec，Hermes 和 pskoett 都依赖这个）
+- 追求**零基础设施**部署（pskoett 甚至连数据库都不要，纯 Markdown + bash hook）
+- **代价**：长会话累计 token 成本可能反超独立 pipeline；agent 能力弱时会漏记
+
+**什么时候选人机协作**：
+- 少量**关键**技能需精雕细琢（Skill-Creator 一个技能 2-3M tokens 成本）
+- 企业级 skill 库需合规审查
+- 有稳定 QA 流程可承担人工评审
+- **代价**：完全不可规模化
+
+### 20.5 混合路线（成熟系统的共同选择）
+
+多数成熟系统走**混合路线**，在线负责"立即可用"，离线负责"深度提炼"：
+
+| 系统 | 在线部分 | 离线部分 | 互补关系 |
+|------|---------|---------|---------|
+| **AutoSkill** | Sidecar 在线抽取 | SkillEvo 遗传 replay | 在线抽草稿，离线选最优 |
+| **Hermes** | `skill_manage` 同步写 | GEPA 离线进化 | agent 写初版，GEPA 演化成品 |
+| **MemOS TS** | `agent_end` 在线抽取 | Task-finalize upgrade 评估 | 抽取即可用，升级走质量门 |
+| **OpenSpace** | ANALYSIS（任务完成触发）| METRIC_MONITOR（周期扫）| 单次事件触发 + 周期体检互补 |
+
+**混合路线的核心逻辑**：**两条路线不冲突而是互补**——在线解决"下次任务能用"，离线解决"长期质量爬升"。
+
+### 20.6 边干边学的隐性成本
+
+**特别提醒**：在线同步（边干边学）看起来"零基础设施"很美，但隐性成本容易被低估：
+
+```
+pskoett SI 单轮成本分解（每轮 +500-2k tokens）：
+  ├─ 读 SKILL.md 元 spec（固定 ~500 tokens）
+  ├─ grep LEARNINGS.md / ERRORS.md（变量，随文件增长）
+  ├─ 判断是否升格（~300-500 tokens 推理）
+  └─ 写入 Markdown（~200 tokens）
+───────────────────────────────────────────────
+  100 轮会话累计：50k ~ 200k tokens
+  对比：Mem0 独立抽取 ~5k tokens / 100 条记忆
+```
+
+**在线同步在短会话下最便宜，长会话下反而最贵**——这是 pskoett 最容易被忽视的代价。
+
+---
+
+## 二十一、选型建议
 
 | 你的需求 | 推荐系统 |
 |---------|---------|
