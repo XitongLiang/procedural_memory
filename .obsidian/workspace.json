@@ -1,0 +1,195 @@
+{
+  "main": {
+    "id": "2766a19fae4f015e",
+    "type": "split",
+    "children": [
+      {
+        "id": "38b6c410ce80a970",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "170c67696a1f1153",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Procedural-Memory-System-Comparison.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Procedural-Memory-System-Comparison"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "8991eff4778a160e",
+    "type": "split",
+    "children": [
+      {
+        "id": "55fb1ee1983a5d52",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "441e1812c0e3c1f6",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "7c422fd51684474f",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "4f9fbac2824a40ba",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "4a573774713c5b9f",
+    "type": "split",
+    "children": [
+      {
+        "id": "9e64da5a74656c14",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0b441373498aa025",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Procedural-Memory-System-Comparison.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Procedural-Memory-System-Comparison 的反向链接列表"
+            }
+          },
+          {
+            "id": "050ecde615e321eb",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Procedural-Memory-System-Comparison.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Procedural-Memory-System-Comparison 的出链列表"
+            }
+          },
+          {
+            "id": "f5f7f5feaac8f79a",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "ba7c10dc3842c9e6",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "添加笔记属性"
+            }
+          },
+          {
+            "id": "d86dcbb1250a5cd6",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Procedural-Memory-System-Comparison.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Procedural-Memory-System-Comparison 的大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:新建数据库": false
+    }
+  },
+  "active": "170c67696a1f1153",
+  "lastOpenFiles": [
+    "spec/design-v6-prompts.md",
+    "spec/design-v6-learning.md",
+    "design-v6-advantages.md",
+    "spec/v6-flow-overview.png",
+    "agentic-procedural-memory-survey.md",
+    "Procedural-Memory-System-Comparison.md"
+  ]
+}
