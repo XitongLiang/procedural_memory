@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Procedural-Memory-System-Comparison.md",
+                "file": "design-v6-advantages.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Procedural-Memory-System-Comparison"
+              "title": "design-v6-advantages"
             }
           }
         ]
@@ -94,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Procedural-Memory-System-Comparison.md",
+                "file": "design-v6-advantages.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Procedural-Memory-System-Comparison 的反向链接列表"
+              "title": "design-v6-advantages 的反向链接列表"
             }
           },
           {
@@ -113,12 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "Procedural-Memory-System-Comparison.md",
+                "file": "design-v6-advantages.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Procedural-Memory-System-Comparison 的出链列表"
+              "title": "design-v6-advantages 的出链列表"
             }
           },
           {
@@ -156,13 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "Procedural-Memory-System-Comparison.md",
+                "file": "design-v6-advantages.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Procedural-Memory-System-Comparison 的大纲"
+              "title": "design-v6-advantages 的大纲"
             }
           }
         ]
@@ -183,13 +183,21 @@
       "bases:新建数据库": false
     }
   },
-  "active": "170c67696a1f1153",
+  "active": "441e1812c0e3c1f6",
   "lastOpenFiles": [
-    "spec/design-v6-prompts.md",
-    "spec/design-v6-learning.md",
+    "design-v6-advantages.md.tmp.12269.1776931370818",
+    "gspd-memory-engine-analysis.md",
+    "gspd-procedural.md",
+    "Procedural-Memory-System-Comparison.md",
     "design-v6-advantages.md",
+    "spec/design-v6-learning.md",
+    "design-v6-advantages.md.tmp.12269.1776929772468",
+    "design-v6-advantages.md.tmp.12269.1776929750529",
+    "design-v6-advantages.md.tmp.12269.1776929719013",
+    "design-v6-advantages.md.tmp.12269.1776929665563",
+    "spec/design-v6-architecture-diagram.md",
+    "spec/design-v6-prompts.md",
     "spec/v6-flow-overview.png",
-    "agentic-procedural-memory-survey.md",
-    "Procedural-Memory-System-Comparison.md"
+    "agentic-procedural-memory-survey.md"
   ]
 }
