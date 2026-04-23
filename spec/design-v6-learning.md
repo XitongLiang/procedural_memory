@@ -42,7 +42,7 @@ Step 1  预过滤（零 LLM，§3）
               成功 toolResult 整条丢 / 错误截 300 字
           §3.2 C 端补齐：JSON blob 反序列化 + 敏感数据脱敏 + 语言标注
 
-Step 2  生成滑动窗口（n=8, m=2, step=6）
+Step 2  生成滑动窗口（n=10, m=2, step=8）
           冷启动：攒够 8 条新 turn → 1 个满窗口
           热启动：6 条新 turn + 2 条 overlap → 1 个满窗口
 
@@ -193,7 +193,7 @@ Task Trace（一条 procedural_task_trace 行）
                             │ flush when chunk ready
                             │
  ┌──── 窗口主题 + 拼接状态机（§5）────┐
- │  滑动窗口 n=8 / m=2 / step=6        │
+ │  滑动窗口 n=10 / m=2 / step=8       │
  │  小模型抽 topic_keywords + topic_summary │
  │    （查 procedural_topic_cache 复用） │
  │  Jaccard > 0.6 合 / ≤ 0.6 小模型兜底 │
@@ -235,9 +235,9 @@ Task Trace（一条 procedural_task_trace 行）
 
 | 参数 | 值 | 说明 |
 |------|----|------|
-| `PROCEDURAL_LEARN_WINDOW_N` | **8** 轮 | 窗口大小（1 轮 = user + assistant 一对） |
+| `PROCEDURAL_LEARN_WINDOW_N` | **10** 轮 | 窗口大小（1 轮 = user + assistant 一对） |
 | `PROCEDURAL_LEARN_WINDOW_M` | 2 轮 | 相邻窗口重叠轮次 |
-| `PROCEDURAL_LEARN_WINDOW_STEP` | **6** 轮 | 滑动步长（n - m） |
+| `PROCEDURAL_LEARN_WINDOW_STEP` | **8** 轮 | 滑动步长（n - m） |
 | `max_windows_per_chunk` | 3 | 主题拼接上限（强制 flush） |
 | `max_gap_hours` | 2 | 时间间隔上限（强制 flush） |
 | `jaccard_threshold` | 0.6 | §5.4 主题边界判断 Jaccard 快速门控阈值 |
@@ -437,7 +437,7 @@ for 每个元素 el：
   el.role == "toolResult" → 文本 `[tool:{toolName} ERROR] {content}`
 ```
 
-一行 `mem_conversation` 拆出的多条逻辑消息共用同一 `id`；窗口切分按逻辑消息计数 (n=8 轮)。
+一行 `mem_conversation` 拆出的多条逻辑消息共用同一 `id`；窗口切分按逻辑消息计数 (n=10 轮)。
 
 #### 3.2.2 敏感数据脱敏（正则，对 user + assistant + toolResult 文本通吃）
 
@@ -517,7 +517,7 @@ Prompt 文件：`src/prompts/files/procedural/topic_extract.{zh,en}.md`（Prompt
 
 ## 背景说明
 
-当前窗口由 n=8 轮对话组成，首尾各有 m=2 轮与相邻窗口重叠（step=6）。
+当前窗口由 n=10 轮对话组成，首尾各有 m=2 轮与相邻窗口重叠（step=8）。
 **锚点轮次**（anchor_turns）是窗口中间的非重叠部分，代表本窗口最核心的独有内容；
 首尾重叠轮次仅作上下文补充，不作为主要提取依据。
 
@@ -1916,7 +1916,7 @@ procedural_candidates        procedural_candidates_vec
   │
   第一层清洗（autoCapture 侧已做；C 端补齐见 §3.2）
   │
-  生成滑动窗口 [W0, W1, W2, ...]（n=8, m=2, step=6）
+  生成滑动窗口 [W0, W1, W2, ...]（n=10, m=2, step=8）
   │
   for Wi in windows:
     │
@@ -2041,7 +2041,7 @@ forceRun    = wk->flushForce
 
 | 设计点 | 来源 |
 |--------|------|
-| 滑动窗口思路（v6 参数 n=8/m=2/step=6） | MemOS Python 端（原参数 n=10，v6 收紧） |
+| 滑动窗口思路（v6 参数 n=10/m=2/step=8） | MemOS Python 端 |
 | 敏感数据脱敏思路 | MemOS Generator（v6 在 §3.2 C 端落地） |
 | 元数据剥离（Sender 块 / message_id / speaker 前缀） | MemOS captureMessages（v6 在 §3.1 TS 端做） |
 | 语言检测（CJK 比例） | MemOS（§3.2 补齐项） |
