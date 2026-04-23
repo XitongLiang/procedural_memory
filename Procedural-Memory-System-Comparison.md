@@ -1,7 +1,54 @@
 # 程序记忆系统横向对比
 
-> 对比范围：Mem0 / ReMe / MemOS / AutoSkill / Hermes / OpenSpace / Skill-Creator / XSkill / OpenViking / pskoett SI / memory-tencentdb
+> 对比范围：Mem0 / ReMe / MemOS / AutoSkill / Hermes / OpenSpace / Skill-Creator / XSkill / OpenViking / Self-Improvement Skill / memory-tencentdb
 > 分析日期：2026-04-21（v8：新增 memory-tencentdb）
+
+---
+
+## 总体洞察
+
+> 11 个系统共用"**提取 → 去重 → 存储 → 召回 → 注入**"五步流水线，真正的设计分化在三条正交决策轴上——**谁决定记** × **什么粒度记** × **什么时候让 agent 看到**。
+
+---
+
+## Presentation 精选版（6 维 × 7 系统）
+
+> 从 11 个系统里精选 7 个代表性样本，覆盖三条决策轴的所有典型位置。6 个核心维度聚焦"产物-架构-触发-质量-演进-成本"五个关键环节。
+
+| 维度                 | **Mem0**                         | **MemOS**                                                                                            | **AutoSkill**                                                                                                | **Hermes**                                                                                                                                    | **OpenViking**                                                                                                                                            | **Self-Improvement Skill**                                 | **memory-tencentdb**                                                                                                |
+| ------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **产物 + 存储**        | 文本快照<br>向量 DB（20+ 后端）+ SQLite 审计 | SKILL.md + scripts/ + evals/<br>SQLite + 文件系统                                                        | SKILL.md（YAML+MD）<br>文件系统 + 向量索引                                                                             | SKILL.md + scripts/ + references/<br>文件系统（~/.hermes/skills/）+ SQLite Archive                                                                  | **程序记忆 4 类**（Agent 侧）：`CASES`（问题→解法）/ `PATTERNS`（workflow）/ `TOOLS`（工具统计）/ `SKILLS`（技能知识）<br>`viking://agent/{space}/memories/*.md` 文件系统 + archive_NNN 归档 | LEARNINGS.md / ERRORS.md / FEATURE.md<br>.learnings/ 本地目录  | **程序记忆** ≈ L1 `instruction` 条目（跟 persona / episodic 共用 L1 JSONL，**无独立 procedural 类型**）<br>SQLite+sqlite-vec+FTS5 / TCVDB+BM25 双后端 |
+| **架构耦合度**          | **解耦**-开放协议（HTTP）                | **解耦**-框架 hook（TS-end）                                                                               | **解耦**-框架 hook（OpenClaw）                                                                                     | **耦合**-agent 自觉（`skill_manage` 工具）                                                                                                            | **解耦**-专有接口（viking://）                                                                                                                                    | **耦合**-agent 自觉（Markdown append）                           | **解耦**-框架 hook（OpenClaw 插件）                                                                                         |
+| **触发时机 + 触发者**     | 显式 API 调用<br>→ **调用方决定**         | **每次** `agent_end` 回调<br>→ **代码硬编码**                                                                 | 滑窗 + `agent_end`<br>→ **代码硬编码**                                                                              | 5+ tool calls / 修复错误 / 发现 workflow<br>→ **LLM 自己判断**                                                                                          | 手动 `session.commit()` 触发（auto_commit_threshold=8000 默认关闭）<br>Phase 1 同步归档 / **Phase 2 异步 fire-and-forget 抽取**（无重试、无 SLA，崩溃即丢）<br>→ **手动 + 代码**                                                                                                                    | `activator.sh` Hook 提醒 + Agent 自觉<br>→ **Agent 自己**        | `agent_end` hook + 后台 L1→L2→L3 管线<br>→ **代码硬编码**                                                                    |
+| **质量门控**           | ✗ 无                              | **写入时** LLM 0-10 打分（<6→draft 不入主召回）<br>**演进时** LLM 7 维评估 + `evals/` 测试集跑测（防回退）                       | **写入时** LLM 4 维判断 add/merge/discard（主观）<br>**运行时** 使用审计 `retrieved≥40 & used==0 → 自动删除`（客观）                  | 无自动（50+ 正则威胁检测 + LLM 自觉）                                                                                                                      | ✗ 无（SKIP 直接硬丢无审计）                                                                                                                                         | **Recurrence ≥ 3 + 跨 2 任务 + 30 天**（硬阈值升格门）                 | ✗ 无（仅 `shouldExtractL1` 结构性过滤）                                                                                      |
+| **演进触发 + 方式**      | ✗ 无演进<br>仅 ADD 追加                | **每次任务完成后** 用 task summary 搜最相似 skill：命中 → upgrade（LLM 7 维评估 + LLM 合并 + `evals/` 跑测）；未命中 → create 新建 | **离线** SkillEvo（champion 遗传变异 + dev/test 三轮 replay，胜出者晋升）<br>**运行时** 使用审计淘汰（`retrieved≥40 & used==0 → 自动删除`） | **在线** agent 发现过时 → 立即 `skill_manage(action='patch')` LLM 改写<br>**离线** GEPA 管线（Gateway flush + Cron）→ 遗传优化 + LLM-as-judge + 测试套件（约束门：新版 ≥ 旧版） | **MemoryArchiver 定期扫** → MERGE/CREATE/SKIP + age>7d 冷归档到 `_archive/`                                                                                      | **Agent 自觉升格** → 三级升格漏斗（Learning → Project Memory → Skill） | **后台 L1→L2→L3 管线** → LLM 四动作（store/skip/update/merge）+ L3 全量重生成                                                     |
+| **总成本**<br>（学习+演进） | **最低**：1 次学习 / 无演进               | **中高**：5-9 次学习 + 每任务 ~4 次 LLM upgrade                                                                | **高**：5-8 次/轮学习 + 遗传 replay（M 变体 × 3 轮）                                                                      | **极低学习 + 极高演进**：1 次 `skill_manage` + GEPA 每代 N× LLM + judge + benchmark                                                                       | **中等**：VLM 抽取 + 向量去重 / 归档零 LLM                                                                                                                            | **隐性摊入 agent**：每轮 +500-2k tokens 摊进思考环，长会话累积高              | **中等**：L1 每次 1-2 次 + 每批 REFINE + L3 全量重生成                                                                           |
+
+
+### 7 个样本的代表性定位
+
+- **Mem0** — 最简基线（verbatim 快照 + API 触发 + 零演进）
+- **MemOS** — 企业级可执行技能（产物最完整 + 自动 upgrade）
+- **AutoSkill** — 使用审计闭环 + 遗传进化（retrieved→relevant→used 闭环独有）
+- **Hermes** — Agent 自觉 + 最完整进化（`skill_manage` + GEPA 约束门）
+- **OpenViking** — 文件系统 paradigm + 多类型分桶（8 桶 URI 寻址）
+- **Self-Improvement Skill** — 零基础设施 + Agent 自觉升格（skill-as-system 范式）
+- **memory-tencentdb** — 分层长程记忆（L0-L3 四层 + Hybrid 检索）
+
+### 三条决策轴上的分布
+
+```
+谁决定记：   调用方 API  ← Mem0
+           代码 hook    ← MemOS / AutoSkill / OpenViking / memory-tencentdb（4 家）
+           Agent 自觉   ← Hermes / Self-Improvement Skill
+
+什么粒度：   单类型      ← Mem0（快照）/ MemOS / AutoSkill / Hermes（都是 skill 单类）
+           多层分类    ← OpenViking（8 桶）/ Self-Improvement Skill（Learning+Skill）/ memory-tencentdb（L0-L3）
+
+什么时候看： 异步        ← Mem0 / MemOS / AutoSkill / OpenViking / memory-tencentdb
+           同步（边干边学）← Hermes / Self-Improvement Skill
+           离线批学    ← AutoSkill SkillEvo / Hermes GEPA
+```
 
 ---
 
@@ -9,7 +56,7 @@
 
 > 21 个关键维度 × 11 个系统的横向摘要。详细分析见后续各章。
 
-| #   | 维度             | **Mem0**                           | **ReMe**              | **MemOS TS**                                              | **AutoSkill**                                    | **Hermes**                            | **OpenSpace**                                                              | **Skill-Creator**            | **OpenViking**                                                              | **pskoett SI**                        | **XSkill**                                         | **memory-tencentdb**                                                                                                |
+| #   | 维度             | **Mem0**                           | **ReMe**              | **MemOS TS**                                              | **AutoSkill**                                    | **Hermes**                            | **OpenSpace**                                                              | **Skill-Creator**            | **OpenViking**                                                              | **Self-Improvement Skill**            | **XSkill**                                         | **memory-tencentdb**                                                                                                |
 | --- | -------------- | ---------------------------------- | --------------------- | --------------------------------------------------------- | ------------------------------------------------ | ------------------------------------- | -------------------------------------------------------------------------- | ---------------------------- | --------------------------------------------------------------------------- | ------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | 1   | **设计哲学**       | Facts                              | Experience            | Knowledge Assets                                          | Skills                                           | Evolution Capital                     | Self-Evolving Skill Engine                                                 | Quality-Tested Skills        | Context as Filesystem                                                       | Learning as Manual Log                | Dual-Stream                                        | Layered LTM (L0-L3)                                                                                                 |
 | 2   | **产物形态**       | 文本快照                               | `when_to_use`+经验      | SKILL+脚本+评估                                               | SKILL.md(YAML)                                   | SKILL+脚本                              | SKILL.md+scripts/+references/（版本 DAG + content_snapshot）                   | SKILL+子代理+评估                 | 目录+URI 文件(L0/L1/L2)                                                         | LEARNINGS.md/ERRORS.md/FEATURE.md     | Experience(≤64词)+Skill                             | L0 JSONL + L1 JSONL(persona/episodic/instruction) + L2 scene MD + L3 persona.md                                     |
@@ -35,20 +82,20 @@
 
 **阅读这张表的三条捷径**：
 
-- **按产物看光谱**：Mem0 快照 → **memory-tencentdb 分层记忆** → ReMe 建议 → MemOS/AutoSkill/Hermes/**OpenSpace** 可执行 SOP → Skill-Creator 测试验证 SOP → XSkill 双流分离 → OpenViking 目录文件 → pskoett 日志漏斗。产物越往右越"通用+抽象"，越往左越"保真+具体"。
-- **按注入方式看**（第 15 行）：Push（Mem0/ReMe/MemOS/AutoSkill/memory-tencentdb，系统推）vs Pull（Hermes/Skill-Creator/OpenViking/pskoett，agent 拉）vs **委派**（OpenSpace 独有，宿主 0 注入）三种范式。
+- **按产物看光谱**：Mem0 快照 → **memory-tencentdb 分层记忆** → ReMe 建议 → MemOS/AutoSkill/Hermes/**OpenSpace** 可执行 SOP → Skill-Creator 测试验证 SOP → XSkill 双流分离 → OpenViking 目录文件 → Self-Improvement Skill 日志漏斗。产物越往右越"通用+抽象"，越往左越"保真+具体"。
+- **按注入方式看**（第 15 行）：Push（Mem0/ReMe/MemOS/AutoSkill/memory-tencentdb，系统推）vs Pull（Hermes/Skill-Creator/OpenViking/Self-Improvement Skill，agent 拉）vs **委派**（OpenSpace 独有，宿主 0 注入）三种范式。
 - **按演进闭环看代差**：**OpenSpace 是唯一一个做 "Tool 质量 → Skill 级联修复" 的跨层闭环**（第 16 行）——其他系统要么只监控 skill（AutoSkill 使用审计），要么只监控 tool，不跨层联动。
 - **按成本/质量看定位**（第 17-18 行分开看）：
-  - **生成成本**：pskoett（摊入 agent）和 Hermes（1 次）最低，Skill-Creator（2-3M tokens）最高；中间按 Mem0 < ReMe < AutoSkill ≈ MemOS < OpenSpace < OpenViking < XSkill 递增。
-  - **演进成本**：Mem0/OpenViking（无/极低）← Hermes GEPA / Skill-Creator 描述优化（极高）是两个极端；OpenSpace 和 pskoett 通过精准触发/agent 摊入控制在中等可控范围。
-  - **Hermes 是典型"生成极低但演进极重"**；**Skill-Creator 两段都贵**；**pskoett 看似 0 LLM 其实都摊进 agent 自身**。
+  - **生成成本**：Self-Improvement Skill（摊入 agent）和 Hermes（1 次）最低，Skill-Creator（2-3M tokens）最高；中间按 Mem0 < ReMe < AutoSkill ≈ MemOS < OpenSpace < OpenViking < XSkill 递增。
+  - **演进成本**：Mem0/OpenViking（无/极低）← Hermes GEPA / Skill-Creator 描述优化（极高）是两个极端；OpenSpace 和 Self-Improvement Skill 通过精准触发/agent 摊入控制在中等可控范围。
+  - **Hermes 是典型"生成极低但演进极重"**；**Skill-Creator 两段都贵**；**Self-Improvement Skill 看似 0 LLM 其实都摊进 agent 自身**。
 - **最大优劣一眼看**（第 19-20 行）：两端给出每个系统的"最突出优点"和"最突出痛点"，适合做决策时快速筛选。
 
 ---
 
 ## 一、核心定位对比
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **设计哲学** | Memory as Facts | Memory as Experience | Memory as Knowledge Assets | Memory as Skills | Memory as Evolution Capital | Memory as Self-Evolving Skill Graph | Memory as Quality-Tested Skills | Context as Filesystem | Learning as Manual Log | Memory as Dual-Stream Knowledge | Memory as Layered Long-term Store |
 | **核心目标** | 任务中断后精确恢复 | 提供情境化经验建议 | 生成可执行技能资产 | 提取可复用方法论 | Agent 随时间自动进化 | 跨 agent 共享自演进技能 + 云协作 | 精雕细琢高质量技能 | 统一上下文管理(memory+resource+skill) | 记录教训→升格为规则→结晶为skill | 双流互补持续积累 | 长程 persona + 事件 + 交互规则统一管理 |
@@ -60,7 +107,7 @@
 
 ## 二、记忆产物形态
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **产物结构** | 逐步骤文本快照 | `when_to_use` + `experience` + tags | SKILL.md + scripts/ + references/ + evals/ | SKILL.md (YAML frontmatter + Markdown) | SKILL.md + scripts/ + references/ | SKILL.md + scripts/（版本 DAG + content_snapshot/diff） | SKILL.md + scripts/ + agents/ + evals/ + eval-viewer/ | viking://agent/skills/ + memories/ | .learnings/LEARNINGS.md ERRORS.md FEATURE_REQUESTS.md | **双流**：Experience(≤64词 condition-action-embedding) + Skill(Markdown SOP) | — |
 | **内容示例** | Step 1: Opened URL... Result: HTML loaded... | {"when_to_use": "当需要分页抓取时", "experience": "使用 BFS 而非 DFS..."} | # Goal / # Steps / # Pitfalls / evals/test_*.json | # Goal / # Constraints & Style / # Workflow | 同标准 SKILL.md 格式 | 同标准 SKILL.md + version DAG（FIX/DERIVED/CAPTURED 分支） | 同标准 SKILL.md + 4子代理评审产物 | ToolPart(截断500字符)+L0/L1摘要 | ## [LRN-YYYYMMDD-XXX] category + Pattern-Key | Experience: "When handling dark images, use histogram equalization" / Skill: # Workflow + ## Tool Templates | — |
@@ -71,7 +118,7 @@
 
 ## 三、提取触发机制
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **触发方式** | 显式 API 调用 | 自动（`agent_end` hook） | 自动（`agent_end` + 话题切换） | 自动（滑动窗口 + `agent_end`） | **LLM 自主判断**（系统提示引导） | **三独立触发器**（ANALYSIS / TOOL_DEGRADATION / METRIC_MONITOR） | **用户主动触发** | session.commit() 后异步 | Hook触发+Agent自觉 | 自动（batch 训练后） | — |
 | **触发条件** | `add(agent_id=..., memory_type="procedural")` | 任务完成，score >= threshold | 任务完成，chunk 数/轮数达标 | 每轮 `messages[-6:]` 延迟提取 | 5+ tool calls / 修复错误 / 发现工作流 | 任务完成 / 工具降级 / 4 比率周期扫描越线 | 用户说"做个技能"/"优化这个技能" | 手动commit 或 auto_commit_threshold=8000 | activator.sh每轮提醒/error-detector.sh命中 | N 次 rollout 全部完成后 | — |
@@ -82,7 +129,7 @@
 
 ## 四、提取 Prompt 设计
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **Prompt 数量** | 1 个专用 | 4 个（成功/失败/对比/验证） | 6-8 个（分段管线） | 3-4 个（提取/决策/合并） | **无独立提取 Prompt**（仅靠系统提示指令） | **5 个**（analysis / fix / derived / captured / confirm） | **无提取 Prompt**（人机迭代创建） | **8 个**（每类别一份 yaml，统一用 VLM） | 0 | **10 个**（P1-P10 覆盖积累+推理两阶段） | — |
 | **Prompt 长度** | ~800 字 | ~400 字 × 4 | ~500-2000 字 × N | **~4000 字**（8 章节） | ~500 字（系统提示中的行为指令） | ~400-800 字 × 5（每个演进类型专用） | ~900 行 SKILL.md（元技能指令） | 按类别模板（profile/events/tools等） | 0（无LLM抽取） | ~200-600 字 × 10 | — |
@@ -96,7 +143,7 @@
 
 这是 v5 新增的核心对比维度。不同系统处理"同一任务多种做法"的能力差异巨大。
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **多路径来源** | 无 | 无 | 无 | 无 | 无 | — | **刻意构造**（with/without skill 并行 spawn） | — | — | **自然产生**（N=4 独立 rollout） | — |
 | **对比方式** | — | — | — | — | — | — | Grader 评分 + Comparator 盲测 A/B + Analyzer 事后分析 | — | — | **Cross-Rollout Critique**（成功/失败轨迹对比提取经验） | — |
@@ -121,7 +168,7 @@
 
 ## 六、去重与合并机制
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **去重策略** | **无**（有意为之） | 向量余弦相似度（阈值 0.5） | 两级：hash + 语义 LLM | 向量 + LLM 4 维判断 | 无独立机制 | 两层：skill_id sidecar + BM25+向量预筛 + LLM Plan-then-Select | 无自动去重（人工控制） | 向量预过滤(top-5)+LLM决策 | Pattern-Key人工分配+Recurrence计数 | **嵌入余弦 ≥0.70 → LLM 合并** | — |
 | **合并策略** | 无 | RewriteMemory 重写合并 | DUPLICATE/UPDATE/NEW 决策 | add / merge / discard 决策 | LLM 自主 patch/edit | FIX（覆写）/ DERIVED（分支）/ CAPTURED（新建），version DAG 多对多 | 人工评审后改进 | MERGE/CREATE/SKIP（类别特定） | 人工See Also链接+状态机更新 | **三层合并**（逐条/容量缩减/全局精炼） | — |
@@ -134,7 +181,7 @@
 
 ## 七、质量门控
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **质量评估** | **无** | **5 维验证** | **0-10 评分** | **4 维能力身份** | **无自动门控** | **4 比率 + tool penalty + LLM 确认门** | **4 子代理 + 人工评审** | ✗ | Recurrence≥3+跨2任务+30天 | **跨 Rollout 对比 + 64 词硬约束** | — |
 | **评估维度** | — | ACTIONABILITY / ACCURACY / RELEVANCE / CLARITY / UNIQUENESS | Repeatable / Transferable / Technical depth / 完整度 | core job / output contract / constraints / context | — | applied_rate / completion_rate / effective_rate / fallback_rate | Grader 断言 + Comparator rubric + Analyzer 模式 + 人工 feedback | — | 出现频率+跨任务泛化+时间稳定性 | 成功/失败轨迹对比 + REFINE 去低质量 | — |
@@ -147,7 +194,7 @@
 
 ## 八、通用化与复用
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **通用化程度** | **无** | 中等 | **高** | **高** | 高 | 高（DERIVED 分支 + GDPVal 实证） | **最高**（测试驱动验证） | 中 | 中(三级升格) | **高**（64 词硬约束 + 占位符） | — |
 | **去标识化方法** | 保留所有具体值 | 抽象为模式描述 | placeholder 替换 | placeholder 替换 | LLM 自主判断 | LLM 演进时自然抽象（无显式占位符机制） | 用户主动控制 | URI路径抽象+目录层级 | 人工提炼Pattern-Key | `[TARGET]` `[QUERY]` 占位符 + 64 词限制强制泛化 | — |
@@ -159,7 +206,7 @@
 
 ## 九、更新策略
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **默认操作** | **ADD**（总是新增） | RewriteMemory 合并更新 | **Skill 层**：`add / upgrade`（upgrade 内部含"升级评估 + 合并 + 附属重建"子步骤）<br>**Chunk 层**：`DUPLICATE / UPDATE / NEW` | **decide** → add/merge/discard | **LLM 自主选择** create/patch/edit | **FIX / DERIVED / CAPTURED**（LLM 选择演进类型） | **人工迭代改进** | MERGE/CREATE/SKIP（类别决定） | ADD（追加Markdown） | **add/modify** → 嵌入去重 → LLM 合并 | — |
 | **UPDATE 条件** | 不支持 | 向量相似命中 → 重写合并 | 语义相似 → 合并内容 | 4 维身份匹配 → merge | LLM 判断 outdated → patch | fallback_rate 越线 / 工具降级 → FIX 覆写 | 人工评审不满意 → 改进 | 向量相似命中+LLM决策MERGE | Recurrence-Count++ / Status更新 | 嵌入余弦 ≥0.70 → LLM 合并 / modify 引用 ID 直接替换 | — |
@@ -171,7 +218,7 @@
 
 ## 十、存储与检索
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **主存储** | 向量 DB（20+ 后端） | 向量 DB（Memory/ES/Chroma） | SQLite + 文件系统 | 文件系统 + 向量索引 | 文件系统（~/.hermes/skills/） | **SQLite 6 张表 + 文件系统** skill 目录 | 文件系统（skill-name/） | 文件系统(viking://) | 文件系统(.learnings/) | **文件系统**（experiences.json + SKILL.md） | — |
 | **辅助存储** | SQLite（审计历史） | 文件系统（ReMeLight） | SKILL.md 磁盘文件 | SkillBank/ + Mirror | SQLite（Session Archive） | version_nodes/edges + BM25 索引 + 向量嵌入 | workspace/ 迭代目录 | archive_NNN/ 顺序归档目录 | 无 | numpy 嵌入缓存 | — |
@@ -186,7 +233,7 @@
 
 > 记忆提取完后，**如何把知识送进 agent 的上下文**是决定实际效果的关键一环。这一节对比各系统的注入路径。
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **注入触发时机** | 调用方主动（API） | `agent_start` hook | `before_prompt_build` hook | `before_prompt_build` hook | Agent 主动调 `skill_search` 工具 | **宿主 0 注入**（委派模式：宿主调 `execute_task` 甩手，OpenSpace 内部自注入到自己的 execution agent） | skill 触发后 agent 读 SKILL.md | Agent 主动 `read` / `ls` | bootstrap 虚拟文件 + 每轮 activator 提醒 | 测试阶段任务开始时 | `before_prompt_build` hook（auto-recall）|
 | **注入位置** | 由调用方决定 | System Prompt | System Prompt（hook 追加） | System Prompt（hook 追加） | System Prompt（三级动态加载） | **宿主侧：无**（只收任务结果 + `evolved_skills` 列表）<br>**OpenSpace 内部：自己执行 agent 的 context** | Agent context（读文件进 context） | Agent context（主动 read） | System Prompt 前置 + 每轮 activator | System Prompt | System Prompt（`appendSystemContext`，4 段注入顺序）|
@@ -204,7 +251,7 @@
 Push（外部推进宿主 prompt）        Pull（宿主自己拉取）        委派（宿主 0 注入）
 ────────────────────────────────────────────────────────────────────────────
 Mem0 / ReMe / MemOS TS /          Hermes / OpenViking /       OpenSpace
-AutoSkill / XSkill                Skill-Creator / pskoett     （宿主只收结果，
+AutoSkill / XSkill                Skill-Creator / Self-Improvement Skill     （宿主只收结果，
 （hook 把记忆推进 context，        （agent 调工具/读文件          skill 由 OpenSpace
  宿主 agent 不感知）                宿主 agent 必须懂记忆）       内部 agent 消费）
 ```
@@ -221,7 +268,7 @@ AutoSkill / XSkill                Skill-Creator / pskoett     （宿主只收结
 原样注入                                           LLM 适配后注入
 ────────────────────────────────────────────────────────────────────
 Mem0 / MemOS TS / AutoSkill /                     ReMe（Rewrite）
-Skill-Creator / pskoett                           Hermes（三级加载）
+Skill-Creator / Self-Improvement Skill                           Hermes（三级加载）
                                                   OpenSpace（Plan-then-Select）
                                                   XSkill（Rewrite + Adapt）
 ```
@@ -253,7 +300,7 @@ Skill Adaptation：LLM 剪裁全局 Skill 到 ≤ 400 词任务特定版
 ```
 召回后做两次 LLM 适配，确保注入内容**贴合当前任务情境**而非原始通用版本。
 
-**pskoett 虚拟文件 + activator 提醒**：
+**Self-Improvement Skill 虚拟文件 + activator 提醒**：
 bootstrap 阶段把 LEARNINGS.md / ERRORS.md 作为**虚拟文件**加载进 agent context；每轮 activator 提醒 agent "遇到错误要查 ERRORS.md"。这是**最轻量的 Pull 式**注入 —— 不强塞进 system prompt，agent 需要时主动查。
 
 ### 注入机制对任务效果的影响
@@ -267,14 +314,14 @@ bootstrap 阶段把 LEARNINGS.md / ERRORS.md 作为**虚拟文件**加载进 age
 
 **没有银弹**：
 - **解耦-Push** 系统（Mem0 / AutoSkill / MemOS）稳定可靠但智能上限受规则限制
-- **耦合-Pull** 系统（Hermes / Skill-Creator / pskoett）智能度高但成本贵、可移植性差
+- **耦合-Pull** 系统（Hermes / Skill-Creator / Self-Improvement Skill）智能度高但成本贵、可移植性差
 - **混合模式**（OpenSpace 外部触发 + LLM 适配 + MCP 工具响应）可能是当前最优平衡点
 
 ---
 
 ## 十二、离线演进
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **有无离线演进** | **无** | **无**（仅老化删除） | **有**（task-finalize upgrade 路径） | **有**（SkillEvo 遗传） | **有**（多层 Dreaming） | **有**（METRIC_MONITOR 周期扫描 + Tool→Skill 级联修复） | **有**（描述自动优化） | **✗**（无 dreaming / 一致性维护；仅有 Phase 2 异步 extraction + hotness archiver） | ✓（三级升格漏斗） | **有**（层次化合并精炼） | — |
 | **触发方式** | — | — | 后台定时扫描 | 后台定时扫描 | Gateway flush + Cron + GEPA | METRIC_MONITOR 周期扫描 + TOOL_DEGRADATION 工具降级 | 用户主动 + run_loop.py 自动 | MemoryArchiver 定期扫描（age>7d + score<0.1 → `_archive/`） | Hook触发+Agent自觉 | 每批 8 样本后自动 | — |
@@ -303,7 +350,7 @@ bootstrap 阶段把 LEARNINGS.md / ERRORS.md 作为**虚拟文件**加载进 age
 | **OpenSpace** | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅（**DAG**）| **FIX / DERIVED / CAPTURED 三态**（独有）+ Tool→Skill 级联 |
 | **Skill-Creator** | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅（iteration-N/）| 人工迭代 + A/B 测试 |
 | **OpenViking** | ✅ | ✅ | ❌ | ❌ | ✅（冷归档）| ❌ | ❌ | MERGE / CREATE / SKIP 三分 + hotness 归档 |
-| **pskoett SI** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | **三级升格漏斗**（Learning → Project Memory → Skill，独有）|
+| **Self-Improvement Skill** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | **三级升格漏斗**（Learning → Project Memory → Skill，独有）|
 | **XSkill** | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌（重编号） | **跨 Rollout Critique + 三层合并精炼** |
 
 **操作定义**：
@@ -422,7 +469,7 @@ MemoryArchiver 定期扫描
 ```
 **冷归档**思路：低价值记忆不删，只"移出视野"，可恢复。
 
-#### pskoett SI：**三级升格漏斗**（独有）
+#### Self-Improvement Skill：**三级升格漏斗**（独有）
 ```
 Level 1: LEARNINGS.md（Learning）
    ↓  Recurrence ≥ 3 + 跨 2 任务 + 30 天
@@ -457,7 +504,7 @@ Experience 合并三层：
 | **OpenSpace** | **DAG**（独有多父 merge） | content_snapshot + content_diff 全保留 | ✅ **可回滚到任意版本** |
 | Skill-Creator | `iteration-N/` 目录 | 所有迭代保留 | ✅ 直接 checkout 旧目录 |
 | OpenViking | 线性 | archive_NNN/messages.jsonl 顺序归档 | ✅ 从归档恢复 |
-| pskoett | 无版本 | 完整保留所有 entry | 靠 git |
+| Self-Improvement Skill | 无版本 | 完整保留所有 entry | 靠 git |
 | XSkill | 重编号（E0, E1, E2...） | 覆盖 | ❌ |
 
 **OpenSpace 的版本 DAG 是独一档的设计**：
@@ -479,7 +526,7 @@ Experience 合并三层：
 | **OpenSpace** | **4 比率 + tool penalty**（多维客观）| 最全面：applied / completion / effective / fallback + 工具健康度 |
 | Skill-Creator | `claude -p` 黑盒测试 + 子代理评审 | 客观测试 + 人工最终决策 |
 | OpenViking | hotness_score（sigmoid 热度衰减）| 使用频次 |
-| pskoett | 人工判断 + Recurrence ≥ 3 硬阈值 | 硬统计门槛 |
+| Self-Improvement Skill | 人工判断 + Recurrence ≥ 3 硬阈值 | 硬统计门槛 |
 | XSkill | 对照 ground_truth + 跨 rollout 对比 | 标准答案 + 多路批判 |
 
 **反馈类型的价值排序**：
@@ -487,7 +534,7 @@ Experience 合并三层：
 2. **使用审计客观数据（AutoSkill、OpenSpace）**：跨场景通用、免 LLM
 3. **LLM 评分（MemOS / Hermes）**：灵活但有谄媚风险
 4. **使用频次（ReMe / OpenViking）**：简单但易被误点击污染
-5. **人工评审（Skill-Creator / pskoett）**：最可靠但不可规模化
+5. **人工评审（Skill-Creator / Self-Improvement Skill）**：最可靠但不可规模化
 
 ### 13.5 四种演进范式
 
@@ -498,9 +545,9 @@ Experience 合并三层：
 | **追加型**（Append-only）| 只增不改，历史保真 | Mem0 |
 | **合并型**（Converge）| 相似条目合并成一个"更好版本" | ReMe, MemOS, AutoSkill, XSkill |
 | **分支型**（Branch）| 同一知识可分派多个变体 | **OpenSpace**（FIX + DERIVED 双路径）|
-| **升格型**（Promote）| 知识分级别，逐级筛选提升 | **pskoett**（三级漏斗）|
+| **升格型**（Promote）| 知识分级别，逐级筛选提升 | **Self-Improvement Skill**（三级漏斗）|
 
-**组合型**：多数系统同时有合并 + 删除，OpenSpace 同时有合并 + 分支（最丰富），pskoett 同时有追加 + 升格。
+**组合型**：多数系统同时有合并 + 删除，OpenSpace 同时有合并 + 分支（最丰富），Self-Improvement Skill 同时有追加 + 升格。
 
 ---
 
@@ -510,7 +557,7 @@ Experience 合并三层：
 
 ### 14.1 学习/提取成本（单次任务）
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **单次提取调用** | **1 次** | **3-4 次** | **5-9 次** | **5-8 次/轮** | **1 次**（agent 的 `skill_manage` 工具调用） | agent loop ≤5 轮 + apply-retry ≤3 次（patch-first） | **~2-3M tokens/技能** | 2-5k tokens×N类别 | **无独立调用，摊入 agent 自身**（每轮读 spec + grep + 写入 + 升格判断，+500-2k tokens） | **N+3+K 次/样本**（N=rollout 数） | — |
 | **调用明细** | 提取摘要 | 提取(1)+验证(1)+重排(1)+重写(1) | 摘要(1)+去重(1)+分类(1)+评估(1)+生成(1)+验证(1)... | 改写(1)+embed(1)+选择(1)+提取(1)+决策(1)+合并(1)+审计(1) | 生成 SKILL.md(1)，作为 agent 自觉工具调用 | analysis(1) + 确认(1) + fix/derived/captured(1) + apply-retry(≤3) | 内容优化: 6子代理/eval×N轮 + 描述优化: 60×`claude -p`/轮×5轮 | VLM抽取(1)+dedup向量过滤+LLM决策 | **Agent 自身推理承担**：读 SKILL.md 元指令、grep LEARNINGS.md、判断是否升格、写入——全在 agent 思考环里 | 图像分析(M)+Rollout Summary(N)+Critique(1)+Experience合并(0-K)+Skill生成(1) | — |
@@ -519,7 +566,7 @@ Experience 合并三层：
 
 ### 14.2 演进/迭代成本（记忆库长期生命周期）
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **有无独立演进 pipeline** | ❌ 无 | ⚠️ 仅老化（规则，0 LLM） | ✅ upgrade 路径（嵌入 task finalize 回调） | ✅ SkillEvo 遗传 + replay（独立离线工具）| ✅ **GEPA 最重** | ✅ **3 触发器**（最全） | ✅ 描述优化 loop | ⚠️ MemoryArchiver（规则，0 LLM） | ❌ 摊入 agent | ✅ 三层合并精炼 | — |
 | **单次演进调用** | — | 0 LLM（老化靠规则）| **M 个候选 × (replay + eval)**（遗传代数）| 同 MemOS + 使用审计（规则）| **GEPA 每代 ~N×LLM 变异 + judge + benchmark**（代数叠加） | ANALYSIS 每任务 3-5 次<br>TOOL_DEGRADATION 级联 M 个依赖 skill × 1-3 次<br>METRIC 周期 × M skills | **60 × `claude -p` × 5 轮**（描述优化单次训练）| 0 LLM（hotness 计算 + 归档） | **Agent 自身承担**（每次自觉判断升格 → 额外推理）| 每批 8 样本 REFINE(1) + 容量>120 强制合并(1-3) | — |
@@ -539,13 +586,13 @@ Experience 合并三层：
 | **OpenSpace** | 中高 | **高但可控** | 学进并重，patch-first 节省 |
 | **Skill-Creator** | 极高 | 极高 | 学进都贵，精品路线 |
 | **OpenViking** | 中 | 极低（归档免费）| 演进弱 |
-| **pskoett SI** | 摊入 agent | 摊入 agent | **隐性成本**，学进都藏在 agent 推理里 |
+| **Self-Improvement Skill** | 摊入 agent | 摊入 agent | **隐性成本**，学进都藏在 agent 推理里 |
 | **XSkill** | 较高 | 中 | 演进靠 batch 摊薄 |
 
 **关键观察**：
 - **Hermes 是典型的"学习极简 + 演进极重"**——agent 写一次 skill_manage 很便宜，但 GEPA 持续演化随时间成本爆炸
 - **OpenSpace 是学进最均衡**——3 触发器精准触发（非定时扫描），patch-first 节省 4-10× token
-- **耦合型系统（Hermes / Skill-Creator / pskoett）的演进成本都比看起来高**——要么有独立 GEPA pipeline（Hermes），要么摊入 agent 推理（pskoett），要么人工 + LLM 双重消耗（Skill-Creator）
+- **耦合型系统（Hermes / Skill-Creator / Self-Improvement Skill）的演进成本都比看起来高**——要么有独立 GEPA pipeline（Hermes），要么摊入 agent 推理（Self-Improvement Skill），要么人工 + LLM 双重消耗（Skill-Creator）
 
 ---
 
@@ -712,7 +759,7 @@ Experience 合并三层：
 
 > 注：Comparison 早期版本曾写过 "LoCoMo10 benchmark 降 83% token" / "检索轨迹可视化" / "OpenClaw 集成" 等条目，但在 [OpenViking_分析.md](./OpenViking_分析.md) 中均**未找到佐证**，已从本对比中移除。如有补充信息（如官方 README / benchmark 报告），请直接更新分析文档后再同步。
 
-### pskoett SI
+### Self-Improvement Skill
 
 **生成/学习**
 | 优势 | 劣势 |
@@ -767,7 +814,7 @@ Experience 合并三层：
 > - **解耦**：记忆操作由外部系统处理（hook / 定时器 / 独立服务），agent 不参与记忆决策，也无需了解记忆系统存在
 > - **耦合**：记忆写入发生在 agent 思考环内（自觉调工具 / 自觉 append 文件 / 读元指令自执行），依赖 agent 自身能力
 
-| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **pskoett SI** | **XSkill** | **memory-tencentdb** |
+| 维度 | **Mem0** | **ReMe** | **MemOS TS** | **AutoSkill** | **Hermes** | **OpenSpace** | **Skill-Creator** | **OpenViking** | **Self-Improvement Skill** | **XSkill** | **memory-tencentdb** |
 | ------ | ---------- | ---------- | -------------- | --------------- | ------------ | ------------ | ------------------- | --- | --- | ------------ | ----- |
 | **耦合度** | **解耦-开放协议** | **解耦-框架 hook** | **解耦-框架 hook** | **解耦-框架 hook** | **耦合-agent 自觉** | **解耦-委派模式**（MCP，宿主 0 记忆负担） | **耦合-agent 执行** | **解耦-专有接口** | **耦合-agent 自觉** | **解耦-独立框架** | **解耦-框架 hook**（OpenClaw 插件）|
 | **记忆执行主体** | 外部调用方 | 外部 hook 触发管线 | 外部 TS 模块（timer+hook） | 外部 JS/Python（hook 触发） | **Agent 自己**（`skill_manage` 工具） | **OpenSpace 内部的独立执行 agent**（宿主委派整任务过来，skill 由 OpenSpace 自己消费并演进） | **Agent 自己**（读 SKILL.md 元指令并执行评估循环） | 外部服务（`session.commit()`） | **Agent 自己**（Hook 提醒后自觉 append Markdown） | 外部 batch pipeline | 外部 `MemoryPipelineManager`（serial queue + checkpoint）|
@@ -781,7 +828,7 @@ Experience 合并三层：
 ```
 解耦（外部处理，宿主不感知）   │   委派（宿主 0 负担）   │   耦合（宿主 agent 思考环内）
                               │                         │
-Mem0  XSkill  ReMe  AutoSkill │      OpenSpace          │  Skill-Creator  pskoett   Hermes
+Mem0  XSkill  ReMe  AutoSkill │      OpenSpace          │  Skill-Creator  Self-Improvement Skill   Hermes
 (HTTP)(独立) (HTTP) (OpenClaw │   (MCP 委派整任务)       │  (读 SKILL.md   (自觉     (skill_manage
              MemOS TS  OpenViking│  OpenSpace 内部有       │   自跑评估)     append    工具)
              (TS hook) (viking://│   独立执行 agent)        │                 Markdown)
@@ -817,7 +864,7 @@ Mem0  XSkill  ReMe  AutoSkill │      OpenSpace          │  Skill-Creator  ps
 ```
 原始保真 ←────────────────────────────────────────────────────────────────→ 通用抽象
 
-Mem0   ReMe    pskoett SI   MemOS    AutoSkill  Hermes  OpenSpace   Skill-Creator   XSkill
+Mem0   ReMe    Self-Improvement Skill   MemOS    AutoSkill  Hermes  OpenSpace   Skill-Creator   XSkill
 (快照) (经验)  (日志漏斗)   (技能包)  (方法论)   (进化)   (自演进)    (精品课程)      (双流)
  │       │         │          │         │         │         │            │            │
  ▼       ▼         ▼          ▼         ▼         ▼         ▼            ▼            ▼
@@ -827,7 +874,7 @@ verbatim 建议性  Markdown    可执行    可执行+  可执行+  可执行+ 
 
 单路径提取 ←────────────────────────────────────────────→ 多路径对比
 
-Mem0 ReMe MemOS AutoSkill Hermes OpenSpace pskoett SI  v5设计      Skill-Creator    XSkill
+Mem0 ReMe MemOS AutoSkill Hermes OpenSpace Self-Improvement Skill  v5设计      Skill-Creator    XSkill
 (无) (无)  (无)   (无)    (无)   (无)       (无)      (会话内检测)  (刻意构造A/B)  (N=4 Rollout)
                                                          │              │              │
                                                          ▼              ▼              ▼
@@ -837,7 +884,7 @@ Mem0 ReMe MemOS AutoSkill Hermes OpenSpace pskoett SI  v5设计      Skill-Creat
 
 依赖 LLM 抽取 ←───────────────────────────────────────────→ 依赖 Spec 让 Agent 自己做
 
-Mem0   MemOS  AutoSkill  XSkill   ReMe    Hermes       OpenSpace     Skill-Creator   pskoett SI
+Mem0   MemOS  AutoSkill  XSkill   ReMe    Hermes       OpenSpace     Skill-Creator   Self-Improvement Skill
 (API)  (代码)  (代码)    (batch)  (代码)  (LLM+工具)    (规则+LLM)     (人机迭代)      (纯 Spec)
                                                          ▲                                ▲
                                                          │                                │
@@ -848,7 +895,7 @@ Mem0   MemOS  AutoSkill  XSkill   ReMe    Hermes       OpenSpace     Skill-Creat
 
 演进闭环完整度 ←────────────────────────────────────────────→ 跨层级联（独有）
 
-pskoett SI  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        OpenSpace
+Self-Improvement Skill  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        OpenSpace
 (升格漏斗)  (无)   (人机评审)    (老化) (upgrade路径) (SkillEvo遗传) (GEPA+Dream)  (Tool→Skill 级联)
                                                                               ▲
                                                                               │
@@ -870,11 +917,11 @@ pskoett SI  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        O
 | 信号类型 | 特征 | 代表系统 |
 |---------|------|---------|
 | **事件型（Event）** | 任务/会话结束、话题切换等离散事件 | Mem0(API) / ReMe(`agent_end`) / MemOS(`agent_end` + 话题切换) / AutoSkill(滑窗 + `agent_end`) / memory-tencentdb(`agent_end`) |
-| **阈值型（Threshold）** | 调用数 / token 数 / recurrence 达标 | Hermes(5+ tool calls) / pskoett(Recurrence≥3 + 跨 2 任务 + 30 天) / OpenViking(`auto_commit_threshold=8000`) |
+| **阈值型（Threshold）** | 调用数 / token 数 / recurrence 达标 | Hermes(5+ tool calls) / Self-Improvement Skill(Recurrence≥3 + 跨 2 任务 + 30 天) / OpenViking(`auto_commit_threshold=8000`) |
 | **LLM 自主（LLM-driven）** | LLM 自己判断"这次值得记" | Hermes(`skill_manage` 工具) / OpenSpace(LLM 二次确认门) |
 | **周期扫描（Periodic）** | 后台定时器扫描 | OpenSpace(METRIC_MONITOR 周期) / AutoSkill(SkillEvo 离线 replay) / XSkill(每 8 样本 batch) / OpenViking(MemoryArchiver) |
 | **指标异常（Metric）** | 4 比率 / fallback_rate / 工具降级等客观指标越线 | OpenSpace(TOOL_DEGRADATION + fallback_rate) / AutoSkill(retrieved≥40 & used==0) |
-| **手动（Manual）** | 用户主动触发 / Agent 自觉 | Skill-Creator(用户说"做个技能") / pskoett(Agent 自觉 + `activator.sh` 提醒) / OpenViking(`session.commit()`) |
+| **手动（Manual）** | 用户主动触发 / Agent 自觉 | Skill-Creator(用户说"做个技能") / Self-Improvement Skill(Agent 自觉 + `activator.sh` 提醒) / OpenViking(`session.commit()`) |
 
 ### 18.2 每个系统的触发全景
 
@@ -888,7 +935,7 @@ pskoett SI  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        O
 | **OpenSpace** | **3 独立触发器**：<br>① ANALYSIS（每任务完成）<br>② TOOL_DEGRADATION（工具降级事件）<br>③ METRIC_MONITOR（周期扫 4 比率） | fallback_rate 越线 / 工具降级 → FIX 覆写<br>`min_selections ≥ 5` 数据门 + LLM 确认门 | ❌ 无硬删（DAG 保留历史，靠检索排序淘汰）|
 | **Skill-Creator** | 用户说"做个技能"/"优化这个技能" | 用户 A/B feedback → 人工改进 | 人工控制 |
 | **OpenViking** | `session.commit()` 手动 或 `auto_commit_threshold=8000` | MERGE（向量命中 + LLM 四分类）| MemoryArchiver：age > 7d + hotness_score < 0.1 → `_archive/` |
-| **pskoett SI** | `activator.sh` 每轮提醒 / `error-detector.sh` grep 命中 | Recurrence-Count++（Pattern-Key 人工分配）| `wont_fix` 状态标记（不删）|
+| **Self-Improvement Skill** | `activator.sh` 每轮提醒 / `error-detector.sh` grep 命中 | Recurrence-Count++（Pattern-Key 人工分配）| `wont_fix` 状态标记（不删）|
 | **XSkill** | N 次 rollout 全完成 → batch pipeline | 嵌入余弦 ≥ 0.70 → LLM 合并 / modify 引用 ID | 全局 REFINE delete 低价值 / 容量 > 120 强制合并最相似对 |
 | **memory-tencentdb** | `agent_end` hook → L0→L1→L2→L3 管线 | LLM 四动作（store/skip/update/merge）| L0/L1 `retentionDays` 规则清理；SKIP 直接硬丢（无审计）|
 
@@ -898,13 +945,13 @@ pskoett SI  Mem0  Skill-Creator  ReMe   MemOS       AutoSkill    Hermes        O
 代码硬编码（规则触发）          LLM 自主决策              人工决策
 ─────────────────────────────────────────────────────────────────────
 Mem0 / ReMe / MemOS TS         Hermes (skill_manage)    Skill-Creator
-AutoSkill / OpenViking         OpenSpace                pskoett (Agent 自判)
+AutoSkill / OpenViking         OpenSpace                Self-Improvement Skill (Agent 自判)
 XSkill / memory-tencentdb      (规则 + LLM 二次确认)
 ```
 
 - **代码硬编码**：稳定可预测，但需要精心调阈值；OpenSpace 的 `_FALLBACK_THRESHOLD=0.4`、AutoSkill 的 `retrieved ≥ 40`、XSkill 的 `余弦 ≥ 0.70` 都是典型硬编码阈值
 - **LLM 自主**：灵活但依赖模型能力，弱模型可能漏记或乱记；Hermes 完全依赖 LLM 判断"值得记"
-- **人工决策**：最可靠但不可规模化；Skill-Creator 把人放在循环里，pskoett 让 agent 自己判断升格
+- **人工决策**：最可靠但不可规模化；Skill-Creator 把人放在循环里，Self-Improvement Skill 让 agent 自己判断升格
 
 ### 18.4 怎么判断"什么时候更新"——UPDATE 的具体判据
 
@@ -965,7 +1012,7 @@ XSkill / memory-tencentdb      (规则 + LLM 二次确认)
 | **OpenSpace** | ❌ | ❌ | ✅（tool_issues）| ✅ | ❌ | ✅（tool 质量指标）| **多类别**（skill + tool 跨层）|
 | **Skill-Creator** | ❌ | ❌ | ❌ | ✅（精品测试过）| ❌ | ❌ | **单一**（技能）|
 | **OpenViking** | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ | **多类别 8 桶**（User/Agent 双侧分桶）|
-| **pskoett SI** | ❌ | ❌ | ✅（LEARNINGS/ERRORS）| ✅（升格后）| ❌ | ❌ | **多类别 2 层**（Learning + Skill）|
+| **Self-Improvement Skill** | ❌ | ❌ | ✅（LEARNINGS/ERRORS）| ✅（升格后）| ❌ | ❌ | **多类别 2 层**（Learning + Skill）|
 | **XSkill** | ❌ | ❌ | ✅（Experience）| ✅（Skill）| ❌ | ❌ | **双流**（Experience + Skill）|
 | **memory-tencentdb** | ✅ | ✅（episodic）| ⚠️ | ✅（instruction）| ✅（persona）| ❌ | **多类别 4 层**（L0/L1/L2/L3，L1 含 persona / episodic / instruction 三子类）|
 
@@ -977,7 +1024,7 @@ XSkill / memory-tencentdb      (规则 + LLM 二次确认)
 Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 (verbatim)   (经验建议)         Skill-Creator                memory-tencentdb (L0-L3)
                                                              XSkill (Experience + Skill)
-                                                             pskoett (Learning + Skill)
+                                                             Self-Improvement Skill (Learning + Skill)
                                                              OpenSpace (Skill + Tool)
 ```
 
@@ -994,7 +1041,7 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 
 | 粒度 | 时间尺度 | 典型内容 | 代表 |
 |------|---------|---------|------|
-| **Action 级**（单步）| 一次工具调用或单个决策 | "用 `rg` 而不是 `grep` 搜代码" | XSkill Experience / pskoett LEARNINGS |
+| **Action 级**（单步）| 一次工具调用或单个决策 | "用 `rg` 而不是 `grep` 搜代码" | XSkill Experience / Self-Improvement Skill LEARNINGS |
 | **Task 级**（单任务）| 一次完整任务的工作流 | "调 FastAPI 的完整流程" | MemOS / AutoSkill / Hermes / OpenSpace / Skill-Creator / XSkill Skill |
 | **Session 级**（会话）| 一段长对话的摘要 | "本次会话主要在调试认证中间件" | Mem0 / OpenViking / memory-tencentdb L2 |
 | **User 级**（跨会话）| 用户长期画像 | "用户偏好简洁回答" | memory-tencentdb L3 persona |
@@ -1026,7 +1073,7 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 |------|------|------|---------|------|
 | **1. 离线批学（Offline Batch）** | 批量数据 → 定期 pipeline 提炼 | 分钟~小时 | 集中但可摊薄 | XSkill (batch=8) / AutoSkill SkillEvo / Hermes GEPA |
 | **2. 在线异步（Online Async）** | 事件触发 → 后台 pipeline 提炼（不阻塞 agent）| 秒~分钟 | 分散但稳定（独立 pipeline）| Mem0 / ReMe / MemOS TS / AutoSkill Sidecar / OpenSpace / OpenViking / memory-tencentdb |
-| **3. 在线同步（Online Sync / 边干边学）** | Agent 思考环内自觉记忆 | 毫秒内（摊入当前推理）| 摊入 agent 自身 token | Hermes (`skill_manage` 工具) / pskoett SI（Agent 自觉 append）|
+| **3. 在线同步（Online Sync / 边干边学）** | Agent 思考环内自觉记忆 | 毫秒内（摊入当前推理）| 摊入 agent 自身 token | Hermes (`skill_manage` 工具) / Self-Improvement Skill（Agent 自觉 append）|
 | **4. 人机协作（Human-in-the-loop）** | 人主导 + LLM 辅助迭代 | 分钟~小时 | 人工 + LLM 双重成本 | Skill-Creator |
 
 ### 20.2 各系统的技术路线归属
@@ -1041,7 +1088,7 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 | **OpenSpace** | 在线异步（3 触发器并行）| ANALYSIS（任务完成）/ TOOL_DEGRADATION（事件）/ METRIC_MONITOR（周期）全异步 |
 | **Skill-Creator** | **人机协作** | 用户主导，子代理 + `claude -p` 辅助测试 |
 | **OpenViking** | 在线异步 | Phase 1 同步归档 + Phase 2 异步抽取（fire-and-forget）|
-| **pskoett SI** | **在线同步（边干边学）** | 成本摊入 agent 自身推理（每轮 +500-2k tokens）|
+| **Self-Improvement Skill** | **在线同步（边干边学）** | 成本摊入 agent 自身推理（每轮 +500-2k tokens）|
 | **XSkill** | **离线批学** | 每 batch=8 样本后触发 pipeline，不在线 |
 | **memory-tencentdb** | 在线异步 | `agent_end` hook + 后台 L1→L2→L3 管线（serial queue + checkpoint）|
 
@@ -1057,7 +1104,7 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 | **可移植性** | 好 | 最好 | 差（强依赖 agent 能力）| 差（流程依赖人）|
 | **基础设施需求** | batch runner + 存储 | hook + pipeline + 存储 | **几乎零**（agent 自带）| UI + 评审工具 |
 | **典型场景** | 研究 / benchmark / 少量高质量 skill | 生产 / 多租户 / 企业级 | 个人开发 / 极简部署 | 精品少量 skill |
-| **代表系统** | XSkill / Hermes GEPA | Mem0 / OpenSpace / memory-tencentdb | Hermes (skill_manage) / pskoett | Skill-Creator |
+| **代表系统** | XSkill / Hermes GEPA | Mem0 / OpenSpace / memory-tencentdb | Hermes (skill_manage) / Self-Improvement Skill | Skill-Creator |
 
 ### 20.4 离线 vs 在线的选型权衡
 
@@ -1074,9 +1121,9 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 - **代价**：需要维护独立 pipeline 基础设施
 
 **什么时候选在线同步（边干边学）**：
-- 个人开发场景，不想维护独立服务（pskoett 的 skill-as-system 极简部署）
-- Agent 模型能力很强（能读懂元 spec，Hermes 和 pskoett 都依赖这个）
-- 追求**零基础设施**部署（pskoett 甚至连数据库都不要，纯 Markdown + bash hook）
+- 个人开发场景，不想维护独立服务（Self-Improvement Skill 的 skill-as-system 极简部署）
+- Agent 模型能力很强（能读懂元 spec，Hermes 和 Self-Improvement Skill 都依赖这个）
+- 追求**零基础设施**部署（Self-Improvement Skill 甚至连数据库都不要，纯 Markdown + bash hook）
 - **代价**：长会话累计 token 成本可能反超独立 pipeline；agent 能力弱时会漏记
 
 **什么时候选人机协作**：
@@ -1103,7 +1150,7 @@ Mem0         ReMe              MemOS / AutoSkill / Hermes / OpenViking (8 桶)
 **特别提醒**：在线同步（边干边学）看起来"零基础设施"很美，但隐性成本容易被低估：
 
 ```
-pskoett SI 单轮成本分解（每轮 +500-2k tokens）：
+Self-Improvement Skill 单轮成本分解（每轮 +500-2k tokens）：
   ├─ 读 SKILL.md 元 spec（固定 ~500 tokens）
   ├─ grep LEARNINGS.md / ERRORS.md（变量，随文件增长）
   ├─ 判断是否升格（~300-500 tokens 推理）
@@ -1113,7 +1160,7 @@ pskoett SI 单轮成本分解（每轮 +500-2k tokens）：
   对比：Mem0 独立抽取 ~5k tokens / 100 条记忆
 ```
 
-**在线同步在短会话下最便宜，长会话下反而最贵**——这是 pskoett 最容易被忽视的代价。
+**在线同步在短会话下最便宜，长会话下反而最贵**——这是 Self-Improvement Skill 最容易被忽视的代价。
 
 ---
 
@@ -1142,14 +1189,14 @@ pskoett SI 单轮成本分解（每轮 +500-2k tokens）：
 | 需要**上下文统一管理层**（记忆+资源+技能合一）| **OpenViking** — viking:// 文件系统 + 8 类分桶（User/Agent 双侧） |
 | 需要**长程会话 Agent**（手动 commit 控制粒度）| **OpenViking** — 两阶段 commit，archive_NNN 顺序归档 |
 | 需要**工具调用语义完整保留** | **OpenViking** — ToolPart(tool_input/output/status/duration_ms，输出截断 500 字符) |
-| 需要**零基础设施** | **pskoett SI** — 无独立 pipeline，纯 Markdown + bash（成本摊入 agent 自身上下文） |
-| 需要**跨编辑器通用技能** | **pskoett SI** — Claude Code / Copilot / OpenClaw 通吃 |
-| 需要**教训→规则的升格漏斗** | **pskoett SI** — Recurrence≥3 + 三级升格 |
-| 需要**作为 outer loop 参考设计** | **pskoett SI** — Inner/Outer loop 概念最清晰 |
-| 需要**零基础设施 + 跨 agent 兼容**（Claude Code / Codex / Copilot 混用） | **pskoett SI** — 纯 Markdown + bash，skill-as-system |
-| 需要**个人开发场景的轻量教训管理** | **pskoett SI** — 三级升格漏斗，Pattern-Key 人工去重 |
-| 需要**把高频规则"结晶"到 system prompt** | **pskoett SI** — Level 2 升格到 CLAUDE.md / AGENTS.md |
-| 需要**skill-as-system 范式参考**（prompt 而非代码实现记忆系统）| **pskoett SI** — 无独立 pipeline，但成本摊入 agent 自身 token |
+| 需要**零基础设施** | **Self-Improvement Skill** — 无独立 pipeline，纯 Markdown + bash（成本摊入 agent 自身上下文） |
+| 需要**跨编辑器通用技能** | **Self-Improvement Skill** — Claude Code / Copilot / OpenClaw 通吃 |
+| 需要**教训→规则的升格漏斗** | **Self-Improvement Skill** — Recurrence≥3 + 三级升格 |
+| 需要**作为 outer loop 参考设计** | **Self-Improvement Skill** — Inner/Outer loop 概念最清晰 |
+| 需要**零基础设施 + 跨 agent 兼容**（Claude Code / Codex / Copilot 混用） | **Self-Improvement Skill** — 纯 Markdown + bash，skill-as-system |
+| 需要**个人开发场景的轻量教训管理** | **Self-Improvement Skill** — 三级升格漏斗，Pattern-Key 人工去重 |
+| 需要**把高频规则"结晶"到 system prompt** | **Self-Improvement Skill** — Level 2 升格到 CLAUDE.md / AGENTS.md |
+| 需要**skill-as-system 范式参考**（prompt 而非代码实现记忆系统）| **Self-Improvement Skill** — 无独立 pipeline，但成本摊入 agent 自身 token |
 | 需要**OpenClaw 分层长期记忆**（persona + 事件 + 交互规则）| **memory-tencentdb** — L0-L3 四层，SQLite/TCVDB 双后端 |
 | 需要**L3 用户画像自动生成** | **memory-tencentdb** — 四层深度扫描（基础锚点/兴趣/交互协议/认知内核）|
 | 需要**Hybrid 检索**（FTS5 + 向量 + RRF）| **memory-tencentdb** — 5s 超时兜底，三种策略可切换 |
@@ -1170,5 +1217,5 @@ pskoett SI 单轮成本分解（每轮 +500-2k tokens）：
 - [XSkill Experience 分析](./XSkill-Experience-Analysis.md) | [arXiv 2603.12056](https://arxiv.org/abs/2603.12056) | [XSkill-Agent/XSkill](https://github.com/XSkill-Agent/XSkill)
 - [OpenSpace 分析](./OpenSpace-Analysis.md) | [HKUDS/OpenSpace](https://github.com/HKUDS/OpenSpace) | [open-space.cloud](https://open-space.cloud)
 - [OpenViking 分析](./OpenViking_分析.md) | [volcengine/OpenViking](https://github.com/volcengine/OpenViking)
-- [pskoett Self-Improvement Skill 分析](./Self-Improvement-Skill-Analysis.md) | [pskoett/pskoett-ai-skills](https://github.com/pskoett/pskoett-ai-skills/tree/main/skills/self-improvement)
+- [Self-Improvement Skill 分析](./Self-Improvement-Skill-Analysis.md) | [pskoett/pskoett-ai-skills](https://github.com/pskoett/pskoett-ai-skills/tree/main/skills/self-improvement)
 - [memory-tencentdb 代码分析](./memory-tencentdb-analysis.md) | OpenClaw 插件（四层 L0-L3 长期记忆 + SQLite/TCVDB 双后端）
